@@ -11,14 +11,18 @@ from app.adapters import google, yandex
 from app.adapters.google import GoogleOAuthNotConfigured
 from app.adapters.yandex import YandexOAuthNotConfigured
 from app.config import settings
+from app.api.deps import current_user
 from app.db import get_db
 from app.domain import Constants as DomainConstants
-from app.models import Provider
-from app.schemas import AppleConnectIn, ConnectionOut, SelectCollectionsIn
+from app.models import AppUser, Provider
+from app.adapters.link import LinkError
+from app.schemas import AppleConnectIn, ConnectionOut, LinkConnectIn, SelectCollectionsIn
 from app.services import oauth_state
 from app.services.connections import (
     create_apple_connection,
+    create_link_connection,
     create_oauth_connection,
+    delete_connection,
     get_connection,
     list_connections,
     select_collections,
@@ -48,35 +52,36 @@ def providers():
         {"id": Provider.GOOGLE, "name": "Google", "oauth": True},
         {"id": Provider.YANDEX, "name": "Яндекс", "oauth": True},
         {"id": Provider.APPLE, "name": "Apple", "oauth": False},
+        {"id": Provider.LINK, "name": "Ссылка на календарь", "oauth": False},
     ]
 
 
 @router.get("/connections", response_model=list[ConnectionOut])
-def connections(db: Session = Depends(get_db)):
-    return [_serialize(item) for item in list_connections(db)]
+def connections(user: AppUser = Depends(current_user), db: Session = Depends(get_db)):
+    return [_serialize(item) for item in list_connections(db, user.id)]
 
 
 @router.get("/connections/{connection_id}", response_model=ConnectionOut)
-def connection_detail(connection_id: uuid.UUID, db: Session = Depends(get_db)):
+def connection_detail(connection_id: uuid.UUID, user: AppUser = Depends(current_user), db: Session = Depends(get_db)):
     try:
-        return _serialize(get_connection(db, connection_id))
+        return _serialize(get_connection(db, connection_id, user.id))
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Подключение не найдено") from error
 
 
 @router.get("/connections/google/start")
-def google_start():
+def google_start(user: AppUser = Depends(current_user)):
     try:
-        url = google.authorization_url(oauth_state.put_state(Provider.GOOGLE))
+        url = google.authorization_url(oauth_state.put_state(Provider.GOOGLE, str(user.id)))
     except GoogleOAuthNotConfigured:
         return RedirectResponse(f"{settings.public_url}/connect?error=google_config")
     return RedirectResponse(url)
 
 
 @router.get("/connections/yandex/start")
-def yandex_start():
+def yandex_start(user: AppUser = Depends(current_user)):
     try:
-        url = yandex.authorization_url(oauth_state.put_state(Provider.YANDEX))
+        url = yandex.authorization_url(oauth_state.put_state(Provider.YANDEX, str(user.id)))
     except YandexOAuthNotConfigured:
         return RedirectResponse(f"{settings.public_url}/connect?error=yandex_config")
     return RedirectResponse(url)
@@ -93,22 +98,44 @@ def yandex_callback(code: str | None = None, state: str | None = None, error: st
 
 
 @router.post("/connections/apple", response_model=ConnectionOut)
-def apple_connect(body: AppleConnectIn, db: Session = Depends(get_db)):
+def apple_connect(body: AppleConnectIn, user: AppUser = Depends(current_user), db: Session = Depends(get_db)):
     try:
-        connection = create_apple_connection(db, body.email.strip(), body.app_password.strip())
+        connection = create_apple_connection(db, user.id, body.email.strip(), body.app_password.strip())
     except Exception as error:
         raise HTTPException(status_code=401, detail="Не удалось войти в iCloud. Проверьте email и пароль приложения.") from error
     return _serialize(connection)
 
 
+@router.post("/connections/link", response_model=ConnectionOut)
+def link_connect(body: LinkConnectIn, user: AppUser = Depends(current_user), db: Session = Depends(get_db)):
+    try:
+        connection = create_link_connection(db, user.id, body.url)
+    except LinkError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return _serialize(connection)
+
+
 @router.patch("/connections/{connection_id}/collections", response_model=ConnectionOut)
-def patch_collections(connection_id: uuid.UUID, body: SelectCollectionsIn, db: Session = Depends(get_db)):
+def patch_collections(
+    connection_id: uuid.UUID,
+    body: SelectCollectionsIn,
+    user: AppUser = Depends(current_user),
+    db: Session = Depends(get_db),
+):
     try:
         ids = [uuid.UUID(item) for item in body.selected_ids]
-        connection = select_collections(db, connection_id, ids)
+        connection = select_collections(db, connection_id, ids, user.id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Подключение не найдено") from error
     return _serialize(connection)
+
+
+@router.delete("/connections/{connection_id}", status_code=204)
+def remove_connection(connection_id: uuid.UUID, user: AppUser = Depends(current_user), db: Session = Depends(get_db)):
+    try:
+        delete_connection(db, connection_id, user.id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Подключение не найдено") from error
 
 
 @router.post("/connections/{connection_id}/sync")
@@ -116,10 +143,11 @@ def enqueue_sync(
     connection_id: uuid.UUID,
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
+    user: AppUser = Depends(current_user),
     db: Session = Depends(get_db),
 ):
     try:
-        get_connection(db, connection_id)
+        get_connection(db, connection_id, user.id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Подключение не найдено") from error
     today = datetime.now(DomainConstants.DISPLAY_TZ).date()
@@ -149,5 +177,5 @@ def _oauth_callback(provider: str, code: str | None, state: str | None, error: s
         secret["expires_at"] = (
             datetime.now(timezone.utc) + timedelta(seconds=int(token["expires_in"]))
         ).isoformat()
-    connection = create_oauth_connection(db, provider, secret, token.get("email"))
+    connection = create_oauth_connection(db, uuid.UUID(payload_state["user_id"]), provider, secret, token.get("email"))
     return RedirectResponse(f"{frontend}?connection_id={connection.id}&step=select")

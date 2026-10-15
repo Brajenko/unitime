@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://slot:slot@localhost:5432/slot"
     redis_url: str = "redis://localhost:6379/0"
     public_url: str = "http://localhost:3000"
+    sync_interval_seconds: int = 900
+    grid_cache_enabled: bool = True
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
 
     google_client_id: str = ""

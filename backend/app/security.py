@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 from hashlib import sha256
@@ -32,3 +34,26 @@ secret_box = SecretBox()
 
 class Constants:
     NONCE_SIZE = 12
+    SALT_SIZE = 16
+    SCRYPT_N = 2**14
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(Constants.SALT_SIZE)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=Constants.SCRYPT_N, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    if not stored:
+        return False
+    try:
+        scheme, salt_hex, digest_hex = stored.split("$")
+    except ValueError:
+        return False
+    if scheme != "scrypt":
+        return False
+    digest = hashlib.scrypt(
+        password.encode("utf-8"), salt=bytes.fromhex(salt_hex), n=Constants.SCRYPT_N, r=8, p=1, dklen=32
+    )
+    return hmac.compare_digest(digest.hex(), digest_hex)

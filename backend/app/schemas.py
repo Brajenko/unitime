@@ -38,16 +38,13 @@ class GridCellOut(BaseModel):
     total: int
     start: datetime
     end: datetime
-    in_suggested: bool
-
-
-class SuggestedSlotOut(BaseModel):
-    start: datetime
-    end: datetime
+    slot_start: bool
+    in_slot: bool
 
 
 class SourceOut(BaseModel):
     id: str
+    connection_id: str
     name: str
     provider: str
     selected: bool
@@ -56,11 +53,56 @@ class SourceOut(BaseModel):
     last_error: str | None = None
 
 
+class MemberOut(BaseModel):
+    user_id: str
+    email: str
+    calendars: int
+    last_synced_at: datetime | None
+    in_overlay: bool
+
+
 class GridOut(BaseModel):
     date_from: str
     date_to: str
     total: int
     cells: list[GridCellOut]
-    suggested: SuggestedSlotOut | None
-    slots: list[SuggestedSlotOut]
+    slot_minutes: int
+    step_minutes: int
     sources: list[SourceOut]
+    members: list[MemberOut]
+    team_id: str | None = None
+
+
+class CredentialsIn(BaseModel):
+    email: str
+    password: str = Field(min_length=1, max_length=256)
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+
+
+class TeamCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class TeamJoinIn(BaseModel):
+    invite_token: str
+
+
+class TeamMemberOut(BaseModel):
+    user_id: str
+    email: str
+
+
+class TeamOut(BaseModel):
+    id: str
+    name: str
+    invite_token: str
+    is_owner: bool
+    members: list[TeamMemberOut]
+
+
+class LinkConnectIn(BaseModel):
+    url: str = Field(min_length=8, max_length=2048)

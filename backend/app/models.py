@@ -15,11 +15,13 @@ class Provider(StrEnum):
     GOOGLE = "google"
     YANDEX = "yandex"
     APPLE = "apple"
+    LINK = "link"
 
 
 class AuthKind(StrEnum):
     OAUTH = "oauth"
     APP_PASSWORD = "app_password"
+    PUBLIC_LINK = "public_link"
 
 
 class ConnectionStatus(StrEnum):
@@ -33,9 +35,37 @@ class AppUser(Base):
     __tablename__ = "app_users"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    email: Mapped[str | None] = mapped_column(String(320), unique=True, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     connections: Mapped[list[CalendarConnection]] = relationship(back_populates="user")
+
+
+class Team(Base):
+    __tablename__ = "teams"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    invite_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    members: Mapped[list[TeamMember]] = relationship(back_populates="team", cascade="all, delete-orphan")
+
+
+class TeamMember(Base):
+    __tablename__ = "team_members"
+    __table_args__ = (UniqueConstraint("team_id", "user_id", name="uq_team_member"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_users.id"), nullable=False)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    team: Mapped[Team] = relationship(back_populates="members")
+    user: Mapped[AppUser] = relationship()
 
 
 class CalendarConnection(Base):

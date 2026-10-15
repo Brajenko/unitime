@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -31,25 +31,14 @@ class GridCell:
     hour: int
     minute: int
     day: str
-
-
-@dataclass(frozen=True)
-class SuggestedSlot:
-    start: datetime
-    end: datetime
+    slot_start: bool = False
+    in_slot: bool = False
 
 
 @dataclass(frozen=True)
 class OverlayResult:
     cells: list[GridCell]
-    slots: list[SuggestedSlot]
     total: int
-
-    @property
-    def suggested(self) -> SuggestedSlot | None:
-        if not self.slots:
-            return None
-        return self.slots[0]
 
 
 def overlay(
@@ -57,18 +46,25 @@ def overlay(
     now: datetime,
     spec: GridSpec | None = None,
 ) -> OverlayResult:
+    """Сетка занятости. Источник — участник: он занят, если занят в любом из своих календарей.
+
+    Слот длины `slot_minutes` может начинаться в клетке (`slot_start`), если эта клетка и
+    следующие подряд в тот же день свободны у всех и начинаются не раньше `now`.
+    `in_slot` — клетка входит хотя бы в один возможный слот.
+    """
     window = spec or default_grid_spec(now.date())
     total = len(sources)
-    cells: list[GridCell] = []
+    merged = [_merge(intervals) for intervals in sources]
     step = timedelta(minutes=window.step_minutes)
     day_count = (window.date_to - window.date_from).days + 1
+    cells: list[GridCell] = []
     for day_index in range(day_count):
         day = window.date_from + timedelta(days=day_index)
         cursor = datetime.combine(day, window.time_start, tzinfo=Constants.DISPLAY_TZ)
         day_end = datetime.combine(day, window.time_end, tzinfo=Constants.DISPLAY_TZ)
         while cursor + step <= day_end:
             end = cursor + step
-            free_count = sum(1 for intervals in sources if not _overlaps_any(intervals, cursor, end))
+            free_count = sum(1 for intervals in merged if not _overlaps(intervals, cursor, end))
             cells.append(
                 GridCell(
                     start=cursor,
@@ -82,50 +78,7 @@ def overlay(
                 )
             )
             cursor = end
-    slots = suggest_slots(cells, total, now, window)
-    return OverlayResult(cells=cells, slots=slots, total=total)
-
-
-def suggest_slot(
-    cells: list[GridCell],
-    total: int,
-    now: datetime,
-    spec: GridSpec | None = None,
-) -> SuggestedSlot | None:
-    found = suggest_slots(cells, total, now, spec)
-    if not found:
-        return None
-    return found[0]
-
-
-def suggest_slots(
-    cells: list[GridCell],
-    total: int,
-    now: datetime,
-    spec: GridSpec | None = None,
-) -> list[SuggestedSlot]:
-    if total == 0:
-        return []
-    window = spec or default_grid_spec(now.date())
-    length = window.slot_minutes // window.step_minutes
-    if length < 1 or window.slot_minutes % window.step_minutes != 0:
-        return []
-    ranked: list[tuple[float, SuggestedSlot]] = []
-    for run in _same_day_runs(cells, total):
-        if len(run) < length:
-            continue
-        best_piece: list[GridCell] | None = None
-        best_score: float | None = None
-        for index in range(len(run) - length + 1):
-            piece = run[index : index + length]
-            score = _score_window(piece, now, window)
-            if best_score is None or score > best_score:
-                best_score = score
-                best_piece = piece
-        if best_piece is not None and best_score is not None:
-            ranked.append((best_score, SuggestedSlot(start=best_piece[0].start, end=best_piece[-1].end)))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [item[1] for item in ranked]
+    return OverlayResult(cells=_mark_slots(cells, now, window), total=total)
 
 
 def monday_of(day: date) -> date:
@@ -187,54 +140,55 @@ def validate_grid_spec(
     )
 
 
-def _overlaps_any(intervals: list[BusyInterval], start: datetime, end: datetime) -> bool:
-    return any(item.start < end and item.end > start for item in intervals)
-
-
-def _same_day_runs(cells: list[GridCell], total: int) -> list[list[GridCell]]:
-    runs: list[list[GridCell]] = []
-    current: list[GridCell] = []
-    for cell in cells:
-        can_extend = (
-            cell.free_count == total
-            and current
-            and cell.start == current[-1].end
-            and cell.day_index == current[-1].day_index
-        )
-        if can_extend:
-            current.append(cell)
+def _merge(intervals: list[BusyInterval]) -> list[tuple[datetime, datetime]]:
+    merged: list[tuple[datetime, datetime]] = []
+    for item in sorted(intervals, key=lambda value: value.start):
+        if item.end <= item.start:
             continue
-        if current:
-            runs.append(current)
-            current = []
-        if cell.free_count == total:
-            current = [cell]
-    if current:
-        runs.append(current)
-    return runs
+        if merged and item.start <= merged[-1][1]:
+            if item.end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], item.end)
+        else:
+            merged.append((item.start, item.end))
+    return merged
 
 
-def _score_window(window: list[GridCell], now: datetime, spec: GridSpec) -> float:
-    start = window[0].start
-    hours = (window[-1].end - window[0].start).total_seconds() / Constants.SECONDS_IN_HOUR
-    rounded = int(round(hours))
-    if abs(hours - rounded) < Constants.HOUR_EPS and rounded in Constants.LENGTH_SCORES:
-        length_score = Constants.LENGTH_SCORES[rounded]
-    else:
-        length_score = hours
-    weekday_score = Constants.WEEKDAY_BONUS if start.weekday() < 5 else 0.0
-    end_minutes = spec.time_end.hour * Constants.MINUTES_IN_HOUR + spec.time_end.minute
-    start_minutes = start.hour * Constants.MINUTES_IN_HOUR + start.minute
-    early_score = float(end_minutes - start_minutes) / Constants.MINUTES_IN_HOUR
-    local_now = now.astimezone(Constants.DISPLAY_TZ)
-    hours_apart = abs((start - local_now).total_seconds()) / Constants.SECONDS_IN_HOUR
-    proximity = -hours_apart * Constants.PROXIMITY_WEIGHT
-    return (
-        length_score * Constants.LENGTH_WEIGHT
-        + weekday_score * Constants.WEEKDAY_WEIGHT
-        + early_score
-        + proximity
-    )
+def _overlaps(merged: list[tuple[datetime, datetime]], start: datetime, end: datetime) -> bool:
+    # последний интервал, начавшийся до конца клетки; интервалы не пересекаются и отсортированы
+    lo, hi = 0, len(merged)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if merged[mid][0] < end:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo > 0 and merged[lo - 1][1] > start
+
+
+def _mark_slots(cells: list[GridCell], now: datetime, spec: GridSpec) -> list[GridCell]:
+    if not cells or cells[0].total == 0:
+        return cells
+    length = spec.slot_minutes // spec.step_minutes
+    if length < 1 or spec.slot_minutes % spec.step_minutes != 0:
+        return cells
+    usable = [cell.free_count == cell.total and cell.start >= now for cell in cells]
+    starts = [False] * len(cells)
+    for index in range(len(cells) - length + 1):
+        if all(
+            usable[index + offset]
+            and cells[index + offset].day_index == cells[index].day_index
+            and (offset == 0 or cells[index + offset].start == cells[index + offset - 1].end)
+            for offset in range(length)
+        ):
+            starts[index] = True
+    covered = [False] * len(cells)
+    for index, is_start in enumerate(starts):
+        if is_start:
+            for offset in range(length):
+                covered[index + offset] = True
+    return [
+        replace(cell, slot_start=starts[index], in_slot=covered[index]) for index, cell in enumerate(cells)
+    ]
 
 
 class Constants:
@@ -248,11 +202,3 @@ class Constants:
     DEFAULT_SLOT_MINUTES = 60
     STEP_MINUTES = (15, 30, 45, 60, 90, 120)
     SLOT_MINUTES = (15, 30, 45, 60, 90, 120, 180)
-    LENGTH_SCORES = {1: 1.0, 2: 2.2, 3: 3.0}
-    LENGTH_WEIGHT = 100.0
-    WEEKDAY_BONUS = 10.0
-    WEEKDAY_WEIGHT = 10.0
-    PROXIMITY_WEIGHT = 0.1
-    SECONDS_IN_HOUR = 3600.0
-    MINUTES_IN_HOUR = 60
-    HOUR_EPS = 0.01

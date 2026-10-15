@@ -12,3 +12,10 @@ celery_app.conf.update(
 )
 
 celery_app.autodiscover_tasks(["app.sync"])
+
+celery_app.conf.beat_schedule = {
+    "sync-all-connections": {
+        "task": "sync_all_connections",
+        "schedule": float(settings.sync_interval_seconds),
+    }
+}

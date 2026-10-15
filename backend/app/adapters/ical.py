@@ -12,13 +12,29 @@ from app.domain import Constants as DomainConstants
 
 def occurrences_from_ics(payload: str, window_start: datetime, window_end: datetime) -> list[BusyOccurrence]:
     calendar = Calendar.from_ical(payload)
+    components = list(calendar.walk("VEVENT"))
+    moved = _moved_instances(components)
     found: list[BusyOccurrence] = []
-    for component in calendar.walk("VEVENT"):
-        found.extend(_expand_event(component, window_start, window_end))
+    for component in components:
+        found.extend(_expand_event(component, window_start, window_end, moved))
     return found
 
 
-def _expand_event(component: Event, window_start: datetime, window_end: datetime) -> list[BusyOccurrence]:
+def _moved_instances(components: list[Event]) -> dict[str, set[datetime]]:
+    """Исходные времена переопределённых экземпляров повторяющейся встречи (RECURRENCE-ID)."""
+    moved: dict[str, set[datetime]] = {}
+    for component in components:
+        recurrence_id = component.get("RECURRENCE-ID")
+        if recurrence_id is None:
+            continue
+        uid = str(component.get("UID") or "unknown")
+        moved.setdefault(uid, set()).add(_as_datetime(recurrence_id.dt))
+    return moved
+
+
+def _expand_event(
+    component: Event, window_start: datetime, window_end: datetime, moved: dict[str, set[datetime]]
+) -> list[BusyOccurrence]:
     status = str(component.get("STATUS", "")).upper()
     transp = str(component.get("TRANSP", "")).upper()
     if status == "CANCELLED" or transp == "TRANSPARENT":
@@ -41,9 +57,10 @@ def _expand_event(component: Event, window_start: datetime, window_end: datetime
     ical_line = "RRULE:" + rrule_value.to_ical().decode("utf-8")
     rule = rrulestr(ical_line, dtstart=start)
     results: list[BusyOccurrence] = []
-    for occurrence in rule.between(window_start, window_end, inc=True):
+    skipped = exdates | moved.get(uid, set())
+    for occurrence in rule.between(window_start - duration, window_end, inc=True):
         occ_start = occurrence if occurrence.tzinfo else occurrence.replace(tzinfo=DomainConstants.DISPLAY_TZ)
-        if occ_start in exdates:
+        if occ_start in skipped:
             continue
         occ_end = occ_start + duration
         if occ_start < window_end and occ_end > window_start:

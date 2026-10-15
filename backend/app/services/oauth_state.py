@@ -10,9 +10,9 @@ from app.config import settings
 _client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
 
 
-def put_state(provider: str) -> str:
+def put_state(provider: str, user_id: str) -> str:
     token = secrets.token_urlsafe(Constants.STATE_BYTES)
-    _client.setex(f"{Constants.PREFIX}{token}", Constants.TTL_SECONDS, json.dumps({"provider": provider}))
+    _client.setex(f"{Constants.PREFIX}{token}", Constants.TTL_SECONDS, json.dumps({"provider": provider, "user_id": user_id}))
     return token
 
 

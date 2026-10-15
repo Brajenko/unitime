@@ -399,3 +399,77 @@ a {
     flex-direction: column;
   }
 }
+
+.user-line {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #555;
+}
+
+.team-panel {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.team-panel select,
+.team-panel input {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border: 1px solid #d0d0d0;
+  font: inherit;
+  font-size: 12px;
+}
+
+.team-create {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.team-create input {
+  margin-bottom: 0;
+}
+
+.invite {
+  font-size: 11px;
+}
+
+.invite {
+  margin-bottom: 8px;
+}
+
+.invite-box {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.invite-box input {
+  margin-bottom: 0;
+}
+
+.source-item {
+  position: relative;
+}
+
+.source-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.source-remove {
+  border: none;
+  background: none;
+  color: #999;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.source-remove:hover {
+  color: #c33;
+}

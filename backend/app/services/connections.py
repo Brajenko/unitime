@@ -6,10 +6,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.adapters import apple, google, yandex
+from app.adapters import apple, google, link, yandex
 from app.adapters.caldav_client import CalDavAuthError
 from app.models import (
-    AppUser,
     AuthKind,
     BusyIntervalRow,
     CalendarCollection,
@@ -18,49 +17,34 @@ from app.models import (
     Provider,
 )
 from app.security import secret_box
+from app.services import cache
 from sqlalchemy.dialects.postgresql import Range
 
 
-DEMO_USER_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
-
-
-def ensure_demo_user(session: Session) -> AppUser:
-    user = session.get(AppUser, DEMO_USER_ID)
-    if user is None:
-        user = AppUser(id=DEMO_USER_ID)
-        session.add(user)
-        session.flush()
-    return user
-
-
-def list_connections(session: Session) -> list[CalendarConnection]:
+def list_connections(session: Session, user_id: uuid.UUID) -> list[CalendarConnection]:
     return list(
         session.scalars(
             select(CalendarConnection)
-            .where(CalendarConnection.user_id == DEMO_USER_ID)
+            .where(CalendarConnection.user_id == user_id)
             .options(selectinload(CalendarConnection.collections))
             .order_by(CalendarConnection.created_at)
         )
     )
 
 
-def get_connection(session: Session, connection_id: uuid.UUID) -> CalendarConnection:
-    connection = session.scalars(
-        select(CalendarConnection)
-        .where(
-            CalendarConnection.id == connection_id,
-            CalendarConnection.user_id == DEMO_USER_ID,
-        )
-        .options(selectinload(CalendarConnection.collections))
-    ).first()
+def get_connection(session: Session, connection_id: uuid.UUID, user_id: uuid.UUID | None = None) -> CalendarConnection:
+    query = select(CalendarConnection).where(CalendarConnection.id == connection_id)
+    if user_id is not None:
+        query = query.where(CalendarConnection.user_id == user_id)
+    connection = session.scalars(query.options(selectinload(CalendarConnection.collections))).first()
     if connection is None:
         raise KeyError("connection")
     return connection
 
 
-def create_oauth_connection(session: Session, provider: str, secret: dict, email: str | None) -> CalendarConnection:
+def create_oauth_connection(session: Session, user_id: uuid.UUID, provider: str, secret: dict, email: str | None) -> CalendarConnection:
     connection = CalendarConnection(
-        user_id=DEMO_USER_ID,
+        user_id=user_id,
         provider=provider,
         auth_kind=AuthKind.OAUTH,
         status=ConnectionStatus.PENDING,
@@ -78,10 +62,10 @@ def create_oauth_connection(session: Session, provider: str, secret: dict, email
     return connection
 
 
-def create_apple_connection(session: Session, email: str, app_password: str) -> CalendarConnection:
+def create_apple_connection(session: Session, user_id: uuid.UUID, email: str, app_password: str) -> CalendarConnection:
     secret = {"email": email, "app_password": app_password}
     connection = CalendarConnection(
-        user_id=DEMO_USER_ID,
+        user_id=user_id,
         provider=Provider.APPLE,
         auth_kind=AuthKind.APP_PASSWORD,
         status=ConnectionStatus.PENDING,
@@ -100,13 +84,43 @@ def create_apple_connection(session: Session, email: str, app_password: str) -> 
     return connection
 
 
-def select_collections(session: Session, connection_id: uuid.UUID, selected_ids: list[uuid.UUID]) -> CalendarConnection:
-    connection = get_connection(session, connection_id)
+def create_link_connection(session: Session, user_id: uuid.UUID, url: str) -> CalendarConnection:
+    normalized = link.normalize_url(url)
+    link.validate(normalized)
+    connection = CalendarConnection(
+        user_id=user_id,
+        provider=Provider.LINK,
+        auth_kind=AuthKind.PUBLIC_LINK,
+        status=ConnectionStatus.ACTIVE,
+        encrypted_secret=secret_box.encrypt({"url": normalized}),
+    )
+    connection.collections.append(
+        CalendarCollection(external_id=Constants.LINK_COLLECTION_ID, display_name=link.title_for(normalized), selected=True)
+    )
+    session.add(connection)
+    session.flush()
+    cache.bump_user(user_id)
+    return connection
+
+
+def select_collections(
+    session: Session, connection_id: uuid.UUID, selected_ids: list[uuid.UUID], user_id: uuid.UUID
+) -> CalendarConnection:
+    connection = get_connection(session, connection_id, user_id)
     selected = set(selected_ids)
     for collection in connection.collections:
         collection.selected = collection.id in selected
     connection.status = ConnectionStatus.ACTIVE
+    session.flush()
+    cache.bump_user(connection.user_id)
     return connection
+
+
+def delete_connection(session: Session, connection_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    connection = get_connection(session, connection_id, user_id)
+    session.delete(connection)
+    session.flush()
+    cache.bump_user(user_id)
 
 
 def save_secret(session: Session, connection: CalendarConnection, secret: dict) -> None:
@@ -200,3 +214,4 @@ def _discover_into(session: Session, connection: CalendarConnection, secret: dic
 
 class Constants:
     REFRESH_SKEW_SECONDS = 120
+    LINK_COLLECTION_ID = "ics"
