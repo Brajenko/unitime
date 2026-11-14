@@ -226,3 +226,8 @@ frontend/dist/
 
 # Temporary files for the temp-quest-6 project
 temp-quest-6/
+
+# Local PostgreSQL backup artifacts (never commit dumps or their checksums)
+/backups/
+*.dump
+*.dump.sha256

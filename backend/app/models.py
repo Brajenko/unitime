@@ -4,8 +4,8 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, LargeBinary, String, Text, UniqueConstraint, Uuid, func
-from sqlalchemy.dialects.postgresql import TSTZRANGE
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, LargeBinary, String, Text, UniqueConstraint, Uuid, func, text
+from sqlalchemy.dialects.postgresql import ExcludeConstraint, TSTZRANGE
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -66,6 +66,30 @@ class TeamMember(Base):
 
     team: Mapped[Team] = relationship(back_populates="members")
     user: Mapped[AppUser] = relationship()
+
+
+class FixedSlot(Base):
+    __tablename__ = "fixed_slots"
+    __table_args__ = (
+        CheckConstraint(
+            "isfinite(starts_at) AND isfinite(ends_at) AND starts_at < ends_at",
+            name="ck_fixed_slots_valid_time",
+        ),
+        ExcludeConstraint(
+            ("team_id", "="),
+            (text("tstzrange(starts_at, ends_at, '[)')"), "&&"),
+            using="gist",
+            name="ex_fixed_slots_team_time",
+        ),
+        Index("ix_fixed_slots_team_starts_at", "team_id", "starts_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_users.id"), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class CalendarConnection(Base):
