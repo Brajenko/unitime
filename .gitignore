@@ -223,3 +223,6 @@ frontend/dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Temporary files for the temp-quest-6 project
+temp-quest-6/
