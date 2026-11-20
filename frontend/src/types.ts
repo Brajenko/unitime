@@ -93,7 +93,12 @@ export type GridMember = {
   status: MemberStatus;
 };
 
-export type MemberStatus = "ok" | "no_calendars" | "auth_failed" | "stale";
+export type MemberStatus = "ok" | "manual" | "no_calendars" | "auth_failed" | "stale";
+
+export type AvailabilityWindow = {
+  start: string;
+  end: string;
+};
 
 export type Meeting = {
   id: string;

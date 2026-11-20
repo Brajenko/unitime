@@ -1,4 +1,4 @@
-import type { Connection, GridResponse, GridSettings, Meeting, ProviderInfo, Team, User } from "./types";
+import type { AvailabilityWindow, Connection, GridResponse, GridSettings, Meeting, ProviderInfo, Team, User } from "./types";
 import { BROWSER_TZ } from "./tz";
 
 export class UnauthorizedError extends Error {}
@@ -117,6 +117,21 @@ export function createMeeting(teamId: string, start: string, end: string, title:
 
 export function cancelMeeting(meetingId: string): Promise<void> {
   return request(`/api/meetings/${meetingId}`, { method: "DELETE" });
+}
+
+function availabilityQuery(settings: GridSettings): string {
+  return new URLSearchParams({ date_from: settings.dateFrom, date_to: settings.dateTo, tz: BROWSER_TZ }).toString();
+}
+
+export function fetchAvailability(settings: GridSettings): Promise<AvailabilityWindow[]> {
+  return request(`/api/me/availability?${availabilityQuery(settings)}`);
+}
+
+export function saveAvailability(settings: GridSettings, windows: AvailabilityWindow[]): Promise<AvailabilityWindow[]> {
+  return request(`/api/me/availability?${availabilityQuery(settings)}`, {
+    method: "PUT",
+    body: JSON.stringify({ windows }),
+  });
 }
 
 export function connectLink(url: string): Promise<Connection> {

@@ -17,11 +17,15 @@ export function memberSummary(members: GridMember[]): MemberSummary {
 
 /** Проблемные участники наверху, внутри групп порядок сохраняется. */
 export function sortMembers(members: GridMember[]): GridMember[] {
-  return [...members].sort((left, right) => Number(left.status === "ok") - Number(right.status === "ok"));
+  return [...members].sort((left, right) => Number(isFine(left)) - Number(isFine(right)));
+}
+
+function isFine(member: GridMember): boolean {
+  return member.status === "ok" || member.status === "manual";
 }
 
 export function memberMark(member: GridMember): string {
-  if (member.status === "ok") {
+  if (member.status === "ok" || member.status === "manual") {
     return "status-active";
   }
   if (member.status === "stale") {
@@ -33,6 +37,9 @@ export function memberMark(member: GridMember): string {
 export function memberNote(member: GridMember, now: number): string {
   if (member.status === "no_calendars") {
     return "не подключил календарь";
+  }
+  if (member.status === "manual") {
+    return "отметил окна вручную";
   }
   if (member.status === "auth_failed") {
     return "доступ к календарю потерян — нужно переподключить";

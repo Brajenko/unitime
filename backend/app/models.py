@@ -137,3 +137,14 @@ class Meeting(Base):
 
     author: Mapped[AppUser] = relationship()
     team: Mapped[Team] = relationship()
+
+
+class AvailabilityWindow(Base):
+    """Свободное окно, отмеченное вручную участником без календаря (US-07)."""
+
+    __tablename__ = "availability_windows"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_users.id"), nullable=False, index=True)
+    period = mapped_column(TSTZRANGE, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

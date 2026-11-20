@@ -544,3 +544,58 @@ a {
   opacity: 0.6;
   cursor: default;
 }
+
+.mark-panel {
+  margin: 8px 0;
+}
+
+.mark-panel-active {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #15803d;
+}
+
+.mark-hint {
+  margin: 0;
+  font-size: 13px;
+}
+
+.grid-wrap.marking .cell {
+  cursor: cell;
+  user-select: none;
+}
+
+.cell.mine::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(21, 128, 61, 0.55);
+  pointer-events: none;
+}
+
+.text-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  background: #fff;
+  color: #1f1f1f;
+  border: 1px solid #1f1f1f;
+  padding: 8px 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.secondary:hover {
+  background: #f2f2f2;
+}
+
+.secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

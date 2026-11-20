@@ -5,19 +5,22 @@ import {
   createMeeting,
   deleteConnection,
   enqueueSync,
+  fetchAvailability,
   fetchConnections,
   fetchGrid,
   fetchMeetings,
   fetchTeams,
   logout,
+  saveAvailability,
   UnauthorizedError,
 } from "../api";
+import { paintRect, windowsForSave, windowsToCellSet } from "../availability";
 import { cacheKey, clearGridCache, loadCachedGrid, saveCachedGrid } from "../gridCache";
 import { memberSummary, missingNames } from "../members";
 import { meetingCellKeys } from "../meetings";
 import { slotPreview } from "../slots";
 import { BROWSER_TZ, clockIn, dayLabelIn } from "../tz";
-import type { GridCell, GridResponse, GridSettings, Meeting, Source, Team, User } from "../types";
+import type { AvailabilityWindow, GridCell, GridResponse, GridSettings, Meeting, Source, Team, User } from "../types";
 import { TeamPanel } from "./TeamPanel";
 
 export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: () => void; teamKey: string }) {
@@ -35,6 +38,12 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   const [pending, setPending] = useState<PendingMeeting | null>(null);
   const [meetingError, setMeetingError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [marking, setMarking] = useState(false);
+  const [myFree, setMyFree] = useState<Set<number>>(() => new Set());
+  const [myOriginal, setMyOriginal] = useState<AvailabilityWindow[]>([]);
+  const [markBusy, setMarkBusy] = useState(false);
+  const [markError, setMarkError] = useState<string | null>(null);
+  const paint = useRef<{ anchor: number; value: boolean; snapshot: Set<number> } | null>(null);
   const syncedRange = useRef<string | null>(null);
   const gridKey = cacheKey(teamId, settings, BROWSER_TZ);
   const applyGrid = useCallback(
@@ -132,6 +141,19 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
     };
   }, [teamId, meetingsTick]);
 
+  useEffect(() => {
+    // разметка привязана к клеткам текущей сетки: при смене настроек выходим из режима
+    setMarking(false);
+  }, [settings, teamId]);
+
+  useEffect(() => {
+    function stopPaint() {
+      paint.current = null;
+    }
+    window.addEventListener("mouseup", stopPaint);
+    return () => window.removeEventListener("mouseup", stopPaint);
+  }, []);
+
   const cellsByKey = useMemo(() => indexCells(grid?.cells ?? []), [grid]);
   const timeKeys = useMemo(() => uniqueClocks(grid?.cells ?? []), [grid]);
   const days = useMemo(() => uniqueDays(grid?.cells ?? []), [grid]);
@@ -152,8 +174,59 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   const summary = useMemo(() => memberSummary(grid?.members ?? []), [grid]);
   const canFix = teamId !== null;
 
+  function startMarking() {
+    if (!grid) {
+      return;
+    }
+    setMarkBusy(true);
+    setMarkError(null);
+    setPending(null);
+    fetchAvailability(settings)
+      .then((windows) => {
+        setMyOriginal(windows);
+        setMyFree(windowsToCellSet(grid.cells, windows));
+        setMarking(true);
+      })
+      .catch((reason: Error) => setError(reason.message))
+      .finally(() => setMarkBusy(false));
+  }
+
+  function paintCell(index: number, start: boolean) {
+    if (!marking || !grid || index < 0) {
+      return;
+    }
+    if (start) {
+      paint.current = { anchor: index, value: !myFree.has(index), snapshot: new Set(myFree) };
+    }
+    const state = paint.current;
+    if (!state) {
+      return;
+    }
+    setMyFree(paintRect(grid.cells, state.snapshot, state.anchor, index, state.value));
+  }
+
+  function saveMarking() {
+    if (!grid) {
+      return;
+    }
+    const range = {
+      start: new Date(`${settings.dateFrom}T00:00:00`).getTime(),
+      end: new Date(`${settings.dateTo}T00:00:00`).getTime() + Constants.MS_IN_DAY,
+    };
+    setMarkBusy(true);
+    setMarkError(null);
+    saveAvailability(settings, windowsForSave(grid.cells, myOriginal, myFree, range))
+      .then(() => fetchGrid(settings, teamId))
+      .then((payload) => {
+        applyGrid(payload);
+        setMarking(false);
+      })
+      .catch((reason: Error) => setMarkError(reason.message))
+      .finally(() => setMarkBusy(false));
+  }
+
   function pickSlot(index: number) {
-    if (!grid || !teamId || index < 0) {
+    if (marking || !grid || !teamId || index < 0) {
       return;
     }
     const indexes = slotPreview(grid.cells, index, Math.round(grid.slot_minutes / grid.step_minutes));
@@ -208,11 +281,15 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
     preview,
     slotRange,
     meetingCells,
-    canFix,
+    canFix: canFix && !marking,
+    marking,
+    mine: myFree,
     onHover: setHovered,
     onPick: pickSlot,
+    onPaint: paintCell,
     stepMinutes: settings.stepMinutes,
   };
+  const hasCalendar = (grid?.sources.length ?? 0) > 0;
 
   return (
     <div className="page">
@@ -227,7 +304,21 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
                 Сетка без учёта: {missingNames(summary)} — зелёные окна могут быть неверными
               </p>
             ) : null}
-            <div className="grid-wrap">
+            <MarkPanel
+              marking={marking}
+              busy={markBusy || !grid}
+              hasCalendar={hasCalendar}
+              count={myFree.size}
+              error={markError}
+              onStart={startMarking}
+              onSave={saveMarking}
+              onClear={() => setMyFree(new Set())}
+              onCancel={() => {
+                setMarking(false);
+                setMarkError(null);
+              }}
+            />
+            <div className={marking ? "grid-wrap marking" : "grid-wrap"}>
               <div
                 className="week-grid"
                 style={gridTemplateStyle(days.length, settings.stepMinutes)}
@@ -243,8 +334,8 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
                 {timeKeys.map((clock) => renderTimeRow(clock, days, rowContext))}
               </div>
             </div>
-            <SlotStatus grid={grid} hasSlots={hasSlots} preview={preview} canFix={canFix} />
-            {pending ? (
+            {marking ? null : <SlotStatus grid={grid} hasSlots={hasSlots} preview={preview} canFix={canFix} />}
+            {pending && !marking ? (
               <MeetingConfirm
                 pending={pending}
                 saving={saving}
@@ -485,10 +576,68 @@ type RowContext = {
   slotRange: string | null;
   meetingCells: Map<number, Meeting>;
   canFix: boolean;
+  marking: boolean;
+  mine: Set<number>;
   onHover: (index: number | null) => void;
   onPick: (index: number) => void;
+  onPaint: (index: number, start: boolean) => void;
   stepMinutes: number;
 };
+
+function MarkPanel({
+  marking,
+  busy,
+  hasCalendar,
+  count,
+  error,
+  onStart,
+  onSave,
+  onClear,
+  onCancel,
+}: {
+  marking: boolean;
+  busy: boolean;
+  hasCalendar: boolean;
+  count: number;
+  error: string | null;
+  onStart: () => void;
+  onSave: () => void;
+  onClear: () => void;
+  onCancel: () => void;
+}) {
+  if (!marking) {
+    return (
+      <p className="mark-panel">
+        <button type="button" className="secondary" disabled={busy} onClick={onStart}>
+          Отметить мои свободные окна
+        </button>
+      </p>
+    );
+  }
+  return (
+    <div className="mark-panel mark-panel-active">
+      <p className="mark-hint">
+        Нажмите на клетку или выделите прямоугольник мышью, когда вы свободны. В днях, где отмечено хоть что-то,
+        остальное время считается занятым; дни без отметок команда не учитывает.
+      </p>
+      {hasCalendar ? (
+        <p className="warning">У вас подключён календарь — сетка считается по нему, ручные окна не учитываются.</p>
+      ) : null}
+      <span className="meeting-confirm-actions">
+        <button type="button" className="primary" disabled={busy} onClick={onSave}>
+          {busy ? "Сохраняем…" : `Сохранить (${count})`}
+        </button>
+        <button type="button" className="text-btn" disabled={busy} onClick={onClear}>
+          Очистить
+        </button>
+        <button type="button" className="text-btn" disabled={busy} onClick={onCancel}>
+          Отмена
+        </button>
+      </span>
+      {error ? <p className="error">{error}</p> : null}
+    </div>
+  );
+}
 
 function renderTimeRow(clock: string, days: DayHeader[], context: RowContext) {
   return (
@@ -519,12 +668,27 @@ function renderCell(dayIndex: number, clock: string, cell: GridCell | undefined,
   if (meeting) {
     classes.push("meeting");
   }
+  if (context.marking) {
+    classes.push("markable");
+    if (context.mine.has(index)) {
+      classes.push("mine");
+    }
+  }
   return (
     <div
       key={`${dayIndex}-${clock}`}
       className={classes.join(" ")}
       style={cellFillStyle(cell, kind, context.stepMinutes, meeting !== undefined)}
-      onMouseEnter={() => context.onHover(index >= 0 ? index : null)}
+      onMouseEnter={() => {
+        context.onHover(index >= 0 ? index : null);
+        context.onPaint(index, false);
+      }}
+      onMouseDown={(event) => {
+        if (context.marking) {
+          event.preventDefault();
+          context.onPaint(index, true);
+        }
+      }}
       onClick={() => context.onPick(index)}
     >
       {cell ? (
@@ -890,6 +1054,11 @@ function readSettings(): GridSettings {
       return fallback;
     }
     const parsed = JSON.parse(raw) as Partial<GridSettings>;
+    if (parsed.dateTo && parsed.dateTo < fallback.dateFrom) {
+      // сохранённый диапазон целиком в прошлом — открываем с сегодняшнего дня
+      parsed.dateFrom = fallback.dateFrom;
+      parsed.dateTo = fallback.dateTo;
+    }
     return clampDates({
       stepMinutes: parsed.stepMinutes ?? fallback.stepMinutes,
       slotMinutes: alignSlotMinutes(parsed.stepMinutes ?? fallback.stepMinutes, parsed.slotMinutes ?? fallback.slotMinutes),
@@ -943,6 +1112,7 @@ class Constants {
   static readonly HOUR_CELL_HEIGHT = 32;
   static readonly CELL_MIN_HEIGHT = 10;
   static readonly MS_IN_MINUTE = 60000;
+  static readonly MS_IN_DAY = 86400000;
   static readonly BUSY_RGB = "226, 56, 56";
   static readonly SLOT_RGB = "21, 92, 45";
   static readonly BUSY_MAX_ALPHA = 0.6;

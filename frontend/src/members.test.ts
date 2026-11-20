@@ -10,7 +10,7 @@ function member(email: string, status: MemberStatus, extra: Partial<GridMember> 
     email,
     calendars: status === "no_calendars" || status === "auth_failed" ? 0 : 1,
     last_synced_at: "2026-12-01T11:55:00Z",
-    in_overlay: status === "ok" || status === "stale",
+    in_overlay: status === "ok" || status === "stale" || status === "manual",
     status,
     ...extra,
   };
@@ -64,6 +64,18 @@ describe("memberNote и memberMark", () => {
     expect(memberMark(member("a@x", "stale"))).toBe("status-syncing");
     expect(memberMark(member("a@x", "no_calendars"))).toBe("status-pending");
     expect(memberMark(member("a@x", "auth_failed"))).toBe("status-auth_failed");
+  });
+});
+
+describe("ручной режим", () => {
+  it("manual учтён, не проблемный и подписан", () => {
+    const manual = member("m@x", "manual", { calendars: 0, last_synced_at: null });
+    const summary = memberSummary([manual, member("b@x", "no_calendars")]);
+    expect(summary.counted).toBe(1);
+    expect(summary.missing.map((item) => item.email)).toEqual(["b@x"]);
+    expect(memberNote(manual, NOW)).toBe("отметил окна вручную");
+    expect(memberMark(manual)).toBe("status-active");
+    expect(sortMembers([manual, member("b@x", "no_calendars")]).map((item) => item.email)).toEqual(["b@x", "m@x"]);
   });
 });
 
