@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.domain import BusyInterval, GridSpec, OverlayResult, overlay
+from app.domain import BusyInterval, GridSpec, OverlayResult, free_to_busy, overlay
+from app.services.availability import users_with_availability, windows_by_user
 from app.models import AppUser, CalendarCollection, CalendarConnection, ConnectionStatus
 
 
@@ -26,7 +27,9 @@ def build_grid(
 ) -> tuple[OverlayResult, list[MemberInfo]]:
     """Источник пересечения — участник: занят, если занят в любом из своих выбранных календарей.
 
-    Участник без выбранных календарей в пересечение не входит: иначе он выглядел бы свободным всегда.
+    Участник без календарей, но с ручными свободными окнами (US-07), занят всё время вне этих окон.
+    Календарь главнее: при подключённом календаре ручные окна не учитываются.
+    Участник без календарей и без ручных окон в пересечение не входит: иначе он выглядел бы свободным всегда.
     """
     users = {user.id: user for user in session.scalars(select(AppUser).where(AppUser.id.in_(user_ids)))}
     collections = list(
@@ -56,6 +59,9 @@ def build_grid(
     per_user: dict[uuid.UUID, list[CalendarCollection]] = {user_id: [] for user_id in user_ids}
     for collection in collections:
         per_user[collection.connection.user_id].append(collection)
+    manual_candidates = [user_id for user_id in user_ids if not per_user.get(user_id)]
+    manual_users = users_with_availability(session, manual_candidates) if manual_candidates else set()
+    manual_windows = windows_by_user(session, list(manual_users), window_start, window_end) if manual_users else {}
     sources: list[list[BusyInterval]] = []
     members: list[MemberInfo] = []
     for user_id in user_ids:
@@ -69,11 +75,15 @@ def build_grid(
                 email=email or "",
                 calendars=len(owned),
                 last_synced_at=last_synced_at,
-                in_overlay=bool(owned),
-                status=member_status(bool(owned), user_id in failed_users, last_synced_at, now),
+                in_overlay=bool(owned) or user_id in manual_users,
+                status=member_status(
+                    bool(owned), user_id in failed_users, last_synced_at, now, has_manual=user_id in manual_users
+                ),
             )
         )
         if not owned:
+            if user_id in manual_users:
+                sources.append(free_to_busy(manual_windows.get(user_id, []), window_start, window_end))
             continue
         intervals: list[BusyInterval] = []
         for collection in owned:
@@ -86,9 +96,17 @@ def build_grid(
     return overlay(sources, now, spec), members
 
 
-def member_status(has_calendars: bool, has_failed: bool, last_synced_at: datetime | None, now: datetime) -> str:
-    """ok / no_calendars / auth_failed / stale: что показать капитану про участника."""
+def member_status(
+    has_calendars: bool,
+    has_failed: bool,
+    last_synced_at: datetime | None,
+    now: datetime,
+    has_manual: bool = False,
+) -> str:
+    """ok / manual / no_calendars / auth_failed / stale: что показать капитану про участника."""
     if not has_calendars:
+        if has_manual:
+            return "manual"
         return "auth_failed" if has_failed else "no_calendars"
     if last_synced_at is None or now - last_synced_at > timedelta(minutes=Constants.STALE_MINUTES):
         return "stale"

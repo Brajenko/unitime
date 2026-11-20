@@ -143,6 +143,26 @@ def validate_grid_spec(
     )
 
 
+def free_to_busy(free: list[BusyInterval], window_start: datetime, window_end: datetime) -> list[BusyInterval]:
+    """Дополнение свободных окон до [window_start, window_end): всё неотмеченное время считается занятым."""
+    busy: list[BusyInterval] = []
+    cursor = window_start
+    for start, end in _merge(free):
+        start, end = max(start, window_start), min(end, window_end)
+        if end <= start:
+            continue
+        if start > cursor:
+            busy.append(BusyInterval(start=cursor, end=start))
+        cursor = max(cursor, end)
+    if cursor < window_end:
+        busy.append(BusyInterval(start=cursor, end=window_end))
+    return busy
+
+
+def merge_intervals(intervals: list[BusyInterval]) -> list[BusyInterval]:
+    return [BusyInterval(start=start, end=end) for start, end in _merge(intervals)]
+
+
 def _merge(intervals: list[BusyInterval]) -> list[tuple[datetime, datetime]]:
     merged: list[tuple[datetime, datetime]] = []
     for item in sorted(intervals, key=lambda value: value.start):

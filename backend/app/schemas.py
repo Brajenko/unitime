@@ -125,3 +125,12 @@ class MeetingOut(BaseModel):
     title: str | None
     created_by_email: str
     can_cancel: bool
+
+
+class AvailabilityWindowIO(BaseModel):
+    start: datetime
+    end: datetime
+
+
+class AvailabilityIn(BaseModel):
+    windows: list[AvailabilityWindowIO] = Field(default_factory=list)

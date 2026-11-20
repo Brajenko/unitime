@@ -24,7 +24,7 @@ def client(monkeypatch):
     with engine.begin() as connection:
         connection.execute(
             text(
-                "TRUNCATE meetings, busy_intervals, calendar_collections, calendar_connections, team_members, teams, app_users CASCADE"
+                "TRUNCATE availability_windows, meetings, busy_intervals, calendar_collections, calendar_connections, team_members, teams, app_users CASCADE"
             )
         )
     with TestClient(app) as test_client:
@@ -363,3 +363,119 @@ def test_grid_tz_param(client):
 
     assert alice.get("/api/grid", params={**params, "tz": "Mars/Base"}).status_code == 400
     assert alice.get("/api/grid", params={**params, "tz": "../etc"}).status_code == 400
+
+
+def _day_params(day):
+    date = day.date().isoformat()
+    return {"date_from": date, "date_to": date}
+
+
+def _windows(*pairs):
+    return {"windows": [{"start": start.isoformat(), "end": end.isoformat()} for start, end in pairs]}
+
+
+def test_availability_put_get_roundtrip(client):
+    alice, _ = _signup(client, "alice@example.com")
+    day = _tomorrow(0)
+    params = _day_params(day)
+    body = _windows(
+        (day.replace(hour=10), day.replace(hour=11)),
+        (day.replace(hour=11), day.replace(hour=12)),
+        (day.replace(hour=15), day.replace(hour=16)),
+    )
+    saved = alice.put("/api/me/availability", params=params, json=body)
+    assert saved.status_code == 200, saved.text
+    assert len(saved.json()) == 2
+    got = alice.get("/api/me/availability", params=params).json()
+    assert [(item["start"][11:16], item["end"][11:16]) for item in got] == [("10:00", "12:00"), ("15:00", "16:00")]
+
+
+def test_availability_replace_only_in_range(client):
+    alice, _ = _signup(client, "alice@example.com")
+    day = _tomorrow(0)
+    later = day + timedelta(days=7)
+    alice.put("/api/me/availability", params=_day_params(later), json=_windows((later.replace(hour=9), later.replace(hour=10))))
+    alice.put("/api/me/availability", params=_day_params(day), json=_windows((day.replace(hour=9), day.replace(hour=10))))
+    alice.put("/api/me/availability", params=_day_params(day), json=_windows())
+    assert alice.get("/api/me/availability", params=_day_params(day)).json() == []
+    assert len(alice.get("/api/me/availability", params=_day_params(later)).json()) == 1
+
+
+def test_availability_validation_400(client):
+    alice, _ = _signup(client, "alice@example.com")
+    day = _tomorrow(0)
+    outside = _windows((day.replace(hour=10) + timedelta(days=1), day.replace(hour=11) + timedelta(days=1)))
+    assert alice.put("/api/me/availability", params=_day_params(day), json=outside).status_code == 400
+    assert alice.get("/api/me/availability", params={**_day_params(day), "tz": "Mars/Base"}).status_code == 400
+    wide = {"date_from": day.date().isoformat(), "date_to": (day + timedelta(days=20)).date().isoformat()}
+    assert alice.get("/api/me/availability", params=wide).status_code == 400
+    assert client.get("/api/me/availability", params=_day_params(day)).status_code == 401
+
+
+def _team_with(alice, bob):
+    team = alice.post("/api/teams", json={"name": "Проект"}).json()
+    bob.post("/api/teams/join", json={"invite_token": team["invite_token"]})
+    return team["id"]
+
+
+def test_manual_member_counted_in_team_grid(client):
+    alice, alice_id = _signup(client, "alice@example.com")
+    bob, _ = _signup(client, "bob@example.com")
+    team_id = _team_with(alice, bob)
+    day = _tomorrow(0)
+    _add_busy(alice_id, "alice-cal", [(day.replace(hour=11), day.replace(hour=12))])
+    bob.put("/api/me/availability", params=_day_params(day), json=_windows((day.replace(hour=10), day.replace(hour=13))))
+
+    payload = alice.get("/api/grid", params={**_day_params(day), "team_id": team_id}).json()
+    assert payload["total"] == 2
+    statuses = {item["email"]: (item["status"], item["in_overlay"]) for item in payload["members"]}
+    assert statuses["bob@example.com"] == ("manual", True)
+    free = {cell["hour"]: cell["free_count"] for cell in payload["cells"]}
+    assert free[10] == 2 and free[12] == 2
+    assert free[11] == 1  # alice занята по календарю
+    assert free[9] == 1 and free[14] == 1  # bob вне своих окон занят
+
+
+def test_calendar_wins_over_manual(client):
+    alice, _ = _signup(client, "alice@example.com")
+    bob, bob_id = _signup(client, "bob@example.com")
+    team_id = _team_with(alice, bob)
+    day = _tomorrow(0)
+    bob.put("/api/me/availability", params=_day_params(day), json=_windows((day.replace(hour=10), day.replace(hour=11))))
+    _add_busy(bob_id, "bob-cal", [(day.replace(hour=15), day.replace(hour=16))])
+
+    payload = alice.get("/api/grid", params={**_day_params(day), "team_id": team_id}).json()
+    bob_info = next(item for item in payload["members"] if item["email"] == "bob@example.com")
+    assert bob_info["status"] == "ok"
+    free = {cell["hour"]: cell["free_count"] for cell in payload["cells"]}
+    # alice без календаря и без окон в сетку не входит, считается только календарь bob
+    assert payload["total"] == 1
+    assert free[9] == 1 and free[15] == 0
+
+
+def test_clearing_availability_returns_no_calendars(client):
+    alice, _ = _signup(client, "alice@example.com")
+    bob, _ = _signup(client, "bob@example.com")
+    team_id = _team_with(alice, bob)
+    day = _tomorrow(0)
+    params = _day_params(day)
+    bob.put("/api/me/availability", params=params, json=_windows((day.replace(hour=10), day.replace(hour=11))))
+    bob.put("/api/me/availability", params=params, json=_windows())
+    payload = alice.get("/api/grid", params={**params, "team_id": team_id}).json()
+    bob_info = next(item for item in payload["members"] if item["email"] == "bob@example.com")
+    assert bob_info["status"] == "no_calendars" and bob_info["in_overlay"] is False
+    assert payload["total"] == 0
+
+
+def test_availability_change_invalidates_grid_cache(client):
+    alice, _ = _signup(client, "alice@example.com")
+    bob, _ = _signup(client, "bob@example.com")
+    team_id = _team_with(alice, bob)
+    day = _tomorrow(0)
+    params = {**_day_params(day), "team_id": team_id}
+    alice.get("/api/grid", params=params)
+    assert alice.get("/api/grid", params=params).headers["x-cache"] == "HIT"
+    bob.put("/api/me/availability", params=_day_params(day), json=_windows((day.replace(hour=10), day.replace(hour=11))))
+    after = alice.get("/api/grid", params=params)
+    assert after.headers["x-cache"] == "MISS"
+    assert after.json()["total"] == 1
