@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cellsToWindows, windowsForSave, windowsToCellSet } from "./availability";
+import { cellsToWindows, paintRect, windowsForSave, windowsToCellSet } from "./availability";
 import type { GridCell } from "./types";
 
 // день 0: 09–13 UTC, день 1: 09–13 UTC, шаг час
@@ -83,5 +83,29 @@ describe("windowsForSave", () => {
     expect(windowsForSave(cells, [], new Set([0, 1]))).toEqual([
       { start: "2026-12-02T09:00:00.000Z", end: "2026-12-02T11:00:00.000Z" },
     ]);
+  });
+});
+
+describe("paintRect", () => {
+  it("отмечает прямоугольник по дням и времени", () => {
+    // от день0 10:00 (1) до день1 11:00 (6)
+    expect([...paintRect(cells, new Set(), 1, 6, true)].sort()).toEqual([1, 2, 5, 6]);
+  });
+
+  it("если потянуть обратно, клетки вне прямоугольника возвращаются к исходному состоянию", () => {
+    const snapshot = new Set([7]);
+    const wide = paintRect(cells, snapshot, 0, 3, true);
+    expect([...wide].sort()).toEqual([0, 1, 2, 3, 7]);
+    const back = paintRect(cells, snapshot, 0, 1, true);
+    expect([...back].sort()).toEqual([0, 1, 7]);
+  });
+
+  it("снятие отметки прямоугольником", () => {
+    const all = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect([...paintRect(cells, all, 2, 7, false)].sort()).toEqual([0, 1, 4, 5]);
+  });
+
+  it("одна клетка при нажатии без протягивания", () => {
+    expect([...paintRect(cells, new Set(), 5, 5, true)]).toEqual([5]);
   });
 });

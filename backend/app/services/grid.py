@@ -63,6 +63,7 @@ def build_grid(
     manual_users = users_with_availability(session, manual_candidates) if manual_candidates else set()
     manual_windows = windows_by_user(session, list(manual_users), window_start, window_end) if manual_users else {}
     sources: list[list[BusyInterval]] = []
+    coverage: list[list[BusyInterval] | None] = []
     members: list[MemberInfo] = []
     for user_id in user_ids:
         owned = per_user.get(user_id, [])
@@ -83,7 +84,9 @@ def build_grid(
         )
         if not owned:
             if user_id in manual_users:
-                sources.append(free_to_busy(manual_windows.get(user_id, []), window_start, window_end))
+                windows = manual_windows.get(user_id, [])
+                sources.append(free_to_busy(windows, window_start, window_end))
+                coverage.append(marked_days(windows, spec.tz))
             continue
         intervals: list[BusyInterval] = []
         for collection in owned:
@@ -93,7 +96,26 @@ def build_grid(
                 if start < window_end and end > window_start:
                     intervals.append(BusyInterval(start=start, end=end))
         sources.append(intervals)
-    return overlay(sources, now, spec), members
+        coverage.append(None)
+    return overlay(sources, now, spec, coverage), members
+
+
+def marked_days(windows: list[BusyInterval], tz) -> list[BusyInterval]:
+    """Дни (в поясе сетки), где участник отметил хоть одно окно: только в них он учитывается."""
+    days: set = set()
+    for item in windows:
+        day = item.start.astimezone(tz).date()
+        last = (item.end - timedelta(microseconds=1)).astimezone(tz).date()
+        while day <= last:
+            days.add(day)
+            day += timedelta(days=1)
+    return [
+        BusyInterval(
+            start=datetime.combine(day, datetime.min.time(), tzinfo=tz),
+            end=datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz),
+        )
+        for day in sorted(days)
+    ]
 
 
 def member_status(

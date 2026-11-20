@@ -97,3 +97,40 @@ function subtract(span: Span, holes: Span[]): Span[] {
 function toSpan(window: AvailabilityWindow): Span {
   return { start: Date.parse(window.start), end: Date.parse(window.end) };
 }
+
+/**
+ * Выделение прямоугольником, как в When2Meet: от клетки, где нажали мышь, до текущей.
+ * Клетки внутри прямоугольника получают `value`, остальные — состояние до начала протягивания,
+ * поэтому если потянуть обратно, лишние клетки возвращаются как были.
+ */
+export function paintRect(
+  cells: GridCell[],
+  snapshot: Set<number>,
+  anchor: number,
+  current: number,
+  value: boolean,
+): Set<number> {
+  const result = new Set(snapshot);
+  const from = cells[anchor];
+  const to = cells[current];
+  if (!from || !to) {
+    return result;
+  }
+  const [dayLow, dayHigh] = [Math.min(from.day_index, to.day_index), Math.max(from.day_index, to.day_index)];
+  const [timeLow, timeHigh] = [Math.min(minuteOfDay(from), minuteOfDay(to)), Math.max(minuteOfDay(from), minuteOfDay(to))];
+  cells.forEach((cell, index) => {
+    const minute = minuteOfDay(cell);
+    if (cell.day_index >= dayLow && cell.day_index <= dayHigh && minute >= timeLow && minute <= timeHigh) {
+      if (value) {
+        result.add(index);
+      } else {
+        result.delete(index);
+      }
+    }
+  });
+  return result;
+}
+
+function minuteOfDay(cell: GridCell): number {
+  return cell.hour * 60 + cell.minute;
+}

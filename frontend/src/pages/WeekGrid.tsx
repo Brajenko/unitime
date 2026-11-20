@@ -14,7 +14,7 @@ import {
   saveAvailability,
   UnauthorizedError,
 } from "../api";
-import { windowsForSave, windowsToCellSet } from "../availability";
+import { paintRect, windowsForSave, windowsToCellSet } from "../availability";
 import { cacheKey, clearGridCache, loadCachedGrid, saveCachedGrid } from "../gridCache";
 import { memberSummary, missingNames } from "../members";
 import { meetingCellKeys } from "../meetings";
@@ -43,7 +43,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   const [myOriginal, setMyOriginal] = useState<AvailabilityWindow[]>([]);
   const [markBusy, setMarkBusy] = useState(false);
   const [markError, setMarkError] = useState<string | null>(null);
-  const paintValue = useRef<boolean | null>(null);
+  const paint = useRef<{ anchor: number; value: boolean; snapshot: Set<number> } | null>(null);
   const syncedRange = useRef<string | null>(null);
   const gridKey = cacheKey(teamId, settings, BROWSER_TZ);
   const applyGrid = useCallback(
@@ -148,7 +148,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
 
   useEffect(() => {
     function stopPaint() {
-      paintValue.current = null;
+      paint.current = null;
     }
     window.addEventListener("mouseup", stopPaint);
     return () => window.removeEventListener("mouseup", stopPaint);
@@ -192,28 +192,17 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   }
 
   function paintCell(index: number, start: boolean) {
-    if (!marking || index < 0) {
+    if (!marking || !grid || index < 0) {
       return;
     }
     if (start) {
-      paintValue.current = !myFree.has(index);
+      paint.current = { anchor: index, value: !myFree.has(index), snapshot: new Set(myFree) };
     }
-    const value = paintValue.current;
-    if (value === null) {
+    const state = paint.current;
+    if (!state) {
       return;
     }
-    setMyFree((current) => {
-      if (current.has(index) === value) {
-        return current;
-      }
-      const next = new Set(current);
-      if (value) {
-        next.add(index);
-      } else {
-        next.delete(index);
-      }
-      return next;
-    });
+    setMyFree(paintRect(grid.cells, state.snapshot, state.anchor, index, state.value));
   }
 
   function saveMarking() {
@@ -619,7 +608,7 @@ function MarkPanel({
   if (!marking) {
     return (
       <p className="mark-panel">
-        <button type="button" className="text-btn" disabled={busy} onClick={onStart}>
+        <button type="button" className="secondary" disabled={busy} onClick={onStart}>
           Отметить мои свободные окна
         </button>
       </p>
@@ -628,7 +617,8 @@ function MarkPanel({
   return (
     <div className="mark-panel mark-panel-active">
       <p className="mark-hint">
-        Нажмите или протяните по клеткам, когда вы свободны. Неотмеченное время в этих днях будет считаться занятым.
+        Нажмите на клетку или выделите прямоугольник мышью, когда вы свободны. В днях, где отмечено хоть что-то,
+        остальное время считается занятым; дни без отметок команда не учитывает.
       </p>
       {hasCalendar ? (
         <p className="warning">У вас подключён календарь — сетка считается по нему, ручные окна не учитываются.</p>
@@ -1064,6 +1054,11 @@ function readSettings(): GridSettings {
       return fallback;
     }
     const parsed = JSON.parse(raw) as Partial<GridSettings>;
+    if (parsed.dateTo && parsed.dateTo < fallback.dateFrom) {
+      // сохранённый диапазон целиком в прошлом — открываем с сегодняшнего дня
+      parsed.dateFrom = fallback.dateFrom;
+      parsed.dateTo = fallback.dateTo;
+    }
     return clampDates({
       stepMinutes: parsed.stepMinutes ?? fallback.stepMinutes,
       slotMinutes: alignSlotMinutes(parsed.stepMinutes ?? fallback.stepMinutes, parsed.slotMinutes ?? fallback.slotMinutes),

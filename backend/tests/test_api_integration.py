@@ -479,3 +479,21 @@ def test_availability_change_invalidates_grid_cache(client):
     after = alice.get("/api/grid", params=params)
     assert after.headers["x-cache"] == "MISS"
     assert after.json()["total"] == 1
+
+
+def test_manual_member_counted_only_on_marked_days(client):
+    alice, alice_id = _signup(client, "alice@example.com")
+    bob, _ = _signup(client, "bob@example.com")
+    team_id = _team_with(alice, bob)
+    day = _tomorrow(0)
+    next_day = day + timedelta(days=1)
+    _add_busy(alice_id, "alice-cal", [(day.replace(hour=20), day.replace(hour=21))])
+    # bob отметил только первый день; второй день он не размечал
+    bob.put("/api/me/availability", params=_day_params(day), json=_windows((day.replace(hour=10), day.replace(hour=12))))
+    params = {"date_from": day.date().isoformat(), "date_to": next_day.date().isoformat(), "team_id": team_id}
+    cells = alice.get("/api/grid", params=params).json()["cells"]
+    first = {cell["hour"]: (cell["free_count"], cell["total"]) for cell in cells if cell["day_index"] == 0}
+    second = {cell["hour"]: (cell["free_count"], cell["total"]) for cell in cells if cell["day_index"] == 1}
+    assert first[10] == (2, 2) and first[15] == (1, 2)  # в размеченный день вне окон bob занят
+    assert second[10] == (1, 1) and second[15] == (1, 1)  # в неразмеченный день bob не учитывается
+    assert any(cell["slot_start"] for cell in cells if cell["day_index"] == 1)

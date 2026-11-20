@@ -46,16 +46,20 @@ def overlay(
     sources: list[list[BusyInterval]],
     now: datetime,
     spec: GridSpec | None = None,
+    coverage: list[list[BusyInterval] | None] | None = None,
 ) -> OverlayResult:
     """Сетка занятости. Источник — участник: он занят, если занят в любом из своих календарей.
 
     Слот длины `slot_minutes` может начинаться в клетке (`slot_start`), если эта клетка и
     следующие подряд в тот же день свободны у всех и начинаются не раньше `now`.
     `in_slot` — клетка входит хотя бы в один возможный слот.
+    `coverage[i]` — где источник i вообще известен (None — везде). Вне покрытия источник
+    не учитывается в клетке: ни в `free_count`, ни в `total` этой клетки.
     """
     window = spec or default_grid_spec(now.date())
     total = len(sources)
     merged = [_merge(intervals) for intervals in sources]
+    known = [_merge(item) if item is not None else None for item in (coverage or [None] * total)]
     step = timedelta(minutes=window.step_minutes)
     day_count = (window.date_to - window.date_from).days + 1
     cells: list[GridCell] = []
@@ -65,13 +69,16 @@ def overlay(
         day_end = datetime.combine(day, window.time_end, tzinfo=window.tz)
         while cursor + step <= day_end:
             end = cursor + step
-            free_count = sum(1 for intervals in merged if not _overlaps(intervals, cursor, end))
+            counted = [
+                intervals for intervals, spans in zip(merged, known) if spans is None or _covers(spans, cursor, end)
+            ]
+            free_count = sum(1 for intervals in counted if not _overlaps(intervals, cursor, end))
             cells.append(
                 GridCell(
                     start=cursor,
                     end=end,
                     free_count=free_count,
-                    total=total,
+                    total=len(counted),
                     day_index=day_index,
                     hour=cursor.hour,
                     minute=cursor.minute,
@@ -188,13 +195,17 @@ def _overlaps(merged: list[tuple[datetime, datetime]], start: datetime, end: dat
     return lo > 0 and merged[lo - 1][1] > start
 
 
+def _covers(merged: list[tuple[datetime, datetime]], start: datetime, end: datetime) -> bool:
+    return any(span_start <= start and span_end >= end for span_start, span_end in merged)
+
+
 def _mark_slots(cells: list[GridCell], now: datetime, spec: GridSpec) -> list[GridCell]:
-    if not cells or cells[0].total == 0:
+    if not cells:
         return cells
     length = spec.slot_minutes // spec.step_minutes
     if length < 1 or spec.slot_minutes % spec.step_minutes != 0:
         return cells
-    usable = [cell.free_count == cell.total and cell.start >= now for cell in cells]
+    usable = [cell.total > 0 and cell.free_count == cell.total and cell.start >= now for cell in cells]
     starts = [False] * len(cells)
     for index in range(len(cells) - length + 1):
         if all(
