@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import uuid
 from datetime import date, datetime, timedelta
 
@@ -16,13 +17,29 @@ from app.celery_app import celery_app
 from app.db import SessionLocal
 from app.domain import Constants as DomainConstants
 from app.models import CalendarConnection, ConnectionStatus, Provider
+from app.config import settings
 from app.services import cache
 from app.services.connections import get_connection, load_secret, refresh_if_needed, replace_busy_window
 
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="sync_connection", bind=True)
+class Constants:
+    MAX_RETRIES = 4
+    BACKOFF_BASE_SECONDS = 30
+    BACKOFF_MAX_SECONDS = 900
+    SOFT_TIME_LIMIT_SECONDS = 50
+    TIME_LIMIT_SECONDS = 60
+    SPREAD_SHARE = 0.8
+    SPREAD_JITTER = 0.1
+
+
+@celery_app.task(
+    name="sync_connection",
+    bind=True,
+    soft_time_limit=Constants.SOFT_TIME_LIMIT_SECONDS,
+    time_limit=Constants.TIME_LIMIT_SECONDS,
+)
 def sync_connection_task(self, connection_id: str, date_from: str, date_to: str) -> None:
     session = SessionLocal()
     try:
@@ -98,8 +115,11 @@ def sync_all_connections_task() -> int:
         session.close()
     today = datetime.now(DomainConstants.DISPLAY_TZ).date()
     end = today + timedelta(days=DomainConstants.MAX_RANGE_DAYS - 1)
-    for connection_id in ids:
-        sync_connection_task.delay(str(connection_id), today.isoformat(), end.isoformat())
+    delays = spread_countdowns(len(ids), settings.sync_interval_seconds)
+    for connection_id, delay in zip(ids, delays):
+        sync_connection_task.apply_async(
+            args=(str(connection_id), today.isoformat(), end.isoformat()), countdown=delay
+        )
     return len(ids)
 
 
@@ -107,6 +127,18 @@ def sync_all_connections_task() -> int:
 def _sync_on_worker_start(**_kwargs) -> None:
     """beat после рестарта ждёт полный интервал; синкаем сразу, чтобы данные не устаревали после выкладки."""
     sync_all_connections_task.delay()
+
+
+def spread_countdowns(count: int, interval_seconds: int) -> list[float]:
+    """Разносит постановку `count` задач по первым 80% интервала, чтобы пачка не забивала воркер.
+
+    Шаг равномерный, к каждой задержке добавлен случайный сдвиг до ±10% шага (порядок не нарушается).
+    """
+    if count <= 0:
+        return []
+    step = interval_seconds * Constants.SPREAD_SHARE / count
+    jitter = step * Constants.SPREAD_JITTER
+    return [max(0.0, index * step + random.uniform(-jitter, jitter)) for index in range(count)]
 
 
 def backoff_seconds(retries: int) -> int:
@@ -121,9 +153,3 @@ def _is_transient(error: Exception) -> bool:
     if isinstance(error, httpx.TransportError):
         return True
     return False
-
-
-class Constants:
-    MAX_RETRIES = 4
-    BACKOFF_BASE_SECONDS = 30
-    BACKOFF_MAX_SECONDS = 900
