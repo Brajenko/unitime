@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -19,6 +19,7 @@ class GridSpec:
     time_end: time
     step_minutes: int
     slot_minutes: int
+    tz: ZoneInfo = field(default_factory=lambda: Constants.DISPLAY_TZ)
 
 
 @dataclass(frozen=True)
@@ -60,8 +61,8 @@ def overlay(
     cells: list[GridCell] = []
     for day_index in range(day_count):
         day = window.date_from + timedelta(days=day_index)
-        cursor = datetime.combine(day, window.time_start, tzinfo=Constants.DISPLAY_TZ)
-        day_end = datetime.combine(day, window.time_end, tzinfo=Constants.DISPLAY_TZ)
+        cursor = datetime.combine(day, window.time_start, tzinfo=window.tz)
+        day_end = datetime.combine(day, window.time_end, tzinfo=window.tz)
         while cursor + step <= day_end:
             end = cursor + step
             free_count = sum(1 for intervals in merged if not _overlaps(intervals, cursor, end))
@@ -108,6 +109,7 @@ def validate_grid_spec(
     time_to: str,
     step_minutes: int,
     slot_minutes: int,
+    tz: ZoneInfo | None = None,
 ) -> GridSpec:
     if step_minutes not in Constants.STEP_MINUTES:
         raise ValueError("Шаг сетки должен быть от 15 минут до 2 часов")
@@ -137,6 +139,7 @@ def validate_grid_spec(
         time_end=end,
         step_minutes=step_minutes,
         slot_minutes=slot_minutes,
+        tz=tz or Constants.DISPLAY_TZ,
     )
 
 

@@ -283,3 +283,83 @@ def test_meeting_cancel_permissions(client):
     own = bob.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(14)).json()["id"]
     assert bob.delete(f"/api/meetings/{own}").status_code == 204
     assert alice.get(f"/api/teams/{team_id}/meetings").json()[0]["can_cancel"] is True
+
+
+def _add_connection(user_id, status, synced_ago=None):
+    from app.db import SessionLocal
+    from app.models import AuthKind, CalendarCollection, CalendarConnection, Provider
+
+    session = SessionLocal()
+    try:
+        connection = CalendarConnection(
+            user_id=uuid.UUID(user_id),
+            provider=Provider.LINK,
+            auth_kind=AuthKind.PUBLIC_LINK,
+            status=status,
+            encrypted_secret=b"x",
+            last_synced_at=datetime.now().astimezone() - synced_ago if synced_ago is not None else None,
+        )
+        connection.collections.append(CalendarCollection(external_id="c", display_name="c", selected=True))
+        session.add(connection)
+        session.commit()
+    finally:
+        session.close()
+
+
+def test_grid_member_status(client):
+    from app.models import ConnectionStatus
+
+    alice, alice_id = _signup(client, "alice@example.com")
+    members = {"alice": (alice, alice_id)}
+    for name in ("bob", "carol", "dave", "erin"):
+        members[name] = _signup(client, f"{name}@example.com")
+    team = alice.post("/api/teams", json={"name": "Проект"}).json()
+    for name in ("bob", "carol", "dave", "erin"):
+        members[name][0].post("/api/teams/join", json={"invite_token": team["invite_token"]})
+
+    _add_connection(alice_id, ConnectionStatus.ACTIVE, timedelta(minutes=3))
+    # bob: календарей нет вовсе
+    _add_connection(members["carol"][1], ConnectionStatus.AUTH_FAILED, timedelta(hours=5))
+    _add_connection(members["dave"][1], ConnectionStatus.ACTIVE, timedelta(hours=1))
+    # erin: подключение есть, но ни разу не синхронизировалось
+    _add_connection(members["erin"][1], ConnectionStatus.PENDING, None)
+
+    payload = alice.get("/api/grid", params={"team_id": team["id"]}).json()
+    statuses = {item["email"].split("@")[0]: item["status"] for item in payload["members"]}
+    assert statuses == {
+        "alice": "ok",
+        "bob": "no_calendars",
+        "carol": "auth_failed",
+        "dave": "stale",
+        "erin": "stale",
+    }
+
+
+def test_grid_generated_at_is_preserved_on_cache_hit(client):
+    alice, _ = _signup(client, "alice@example.com")
+    first = alice.get("/api/grid")
+    second = alice.get("/api/grid")
+    assert first.headers["x-cache"] == "MISS" and second.headers["x-cache"] == "HIT"
+    assert first.json()["generated_at"] == second.json()["generated_at"]
+
+
+def test_grid_tz_param(client):
+    alice, alice_id = _signup(client, "alice@example.com")
+    day = _tomorrow(0)
+    _add_busy(alice_id, "cal", [(day.replace(hour=10), day.replace(hour=12))])
+    params = {"date_from": day.date().isoformat(), "date_to": day.date().isoformat()}
+
+    moscow = alice.get("/api/grid", params=params)
+    ekb = alice.get("/api/grid", params={**params, "tz": "Asia/Yekaterinburg"})
+    assert moscow.status_code == 200 and ekb.status_code == 200
+    assert moscow.json()["tz"] == "Europe/Moscow" and ekb.json()["tz"] == "Asia/Yekaterinburg"
+
+    def busy_hours(response):
+        return [cell["hour"] for cell in response.json()["cells"] if cell["free_count"] == 0]
+
+    assert busy_hours(moscow) == [10, 11]
+    assert busy_hours(ekb) == [12, 13]
+    assert ekb.json()["cells"][0]["start"].endswith("+05:00")
+
+    assert alice.get("/api/grid", params={**params, "tz": "Mars/Base"}).status_code == 400
+    assert alice.get("/api/grid", params={**params, "tz": "../etc"}).status_code == 400

@@ -59,6 +59,7 @@ class MemberOut(BaseModel):
     calendars: int
     last_synced_at: datetime | None
     in_overlay: bool
+    status: str
 
 
 class GridOut(BaseModel):
@@ -71,6 +72,8 @@ class GridOut(BaseModel):
     sources: list[SourceOut]
     members: list[MemberOut]
     team_id: str | None = None
+    generated_at: datetime
+    tz: str
 
 
 class CredentialsIn(BaseModel):

@@ -8,7 +8,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.domain import BusyInterval, GridSpec, OverlayResult, overlay
-from app.domain import Constants as DomainConstants
 from app.models import AppUser, CalendarCollection, CalendarConnection, ConnectionStatus
 
 
@@ -19,6 +18,7 @@ class MemberInfo:
     calendars: int
     last_synced_at: datetime | None
     in_overlay: bool
+    status: str
 
 
 def build_grid(
@@ -43,9 +43,15 @@ def build_grid(
             .options(selectinload(CalendarCollection.busy_intervals), selectinload(CalendarCollection.connection))
         )
     )
-    window_start = datetime.combine(spec.date_from, datetime.min.time(), tzinfo=DomainConstants.DISPLAY_TZ)
-    window_end = datetime.combine(
-        spec.date_to + timedelta(days=1), datetime.min.time(), tzinfo=DomainConstants.DISPLAY_TZ
+    window_start = datetime.combine(spec.date_from, datetime.min.time(), tzinfo=spec.tz)
+    window_end = datetime.combine(spec.date_to + timedelta(days=1), datetime.min.time(), tzinfo=spec.tz)
+    failed_users = set(
+        session.scalars(
+            select(CalendarConnection.user_id).where(
+                CalendarConnection.user_id.in_(user_ids),
+                CalendarConnection.status == ConnectionStatus.AUTH_FAILED,
+            )
+        )
     )
     per_user: dict[uuid.UUID, list[CalendarCollection]] = {user_id: [] for user_id in user_ids}
     for collection in collections:
@@ -56,13 +62,15 @@ def build_grid(
         owned = per_user.get(user_id, [])
         syncs = [item.connection.last_synced_at for item in owned if item.connection.last_synced_at]
         email = users[user_id].email if user_id in users else ""
+        last_synced_at = min(syncs) if syncs and len(syncs) == len(owned) else None
         members.append(
             MemberInfo(
                 user_id=user_id,
                 email=email or "",
                 calendars=len(owned),
-                last_synced_at=min(syncs) if syncs and len(syncs) == len(owned) else None,
+                last_synced_at=last_synced_at,
                 in_overlay=bool(owned),
+                status=member_status(bool(owned), user_id in failed_users, last_synced_at, now),
             )
         )
         if not owned:
@@ -76,6 +84,15 @@ def build_grid(
                     intervals.append(BusyInterval(start=start, end=end))
         sources.append(intervals)
     return overlay(sources, now, spec), members
+
+
+def member_status(has_calendars: bool, has_failed: bool, last_synced_at: datetime | None, now: datetime) -> str:
+    """ok / no_calendars / auth_failed / stale: что показать капитану про участника."""
+    if not has_calendars:
+        return "auth_failed" if has_failed else "no_calendars"
+    if last_synced_at is None or now - last_synced_at > timedelta(minutes=Constants.STALE_MINUTES):
+        return "stale"
+    return "ok"
 
 
 def list_selected_sources(session: Session, user_id: uuid.UUID) -> list[dict]:
@@ -100,3 +117,7 @@ def list_selected_sources(session: Session, user_id: uuid.UUID) -> list[dict]:
         for item in rows
         if item.selected
     ]
+
+
+class Constants:
+    STALE_MINUTES = 30
