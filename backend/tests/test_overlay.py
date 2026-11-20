@@ -1,23 +1,14 @@
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
-from app.domain import BusyInterval, GridSpec, overlay, suggest_slot, validate_grid_spec
+from app.domain import BusyInterval, GridSpec, overlay, validate_grid_spec
 from app.domain import Constants as DomainConstants
 
 
 def test_overlay_counts_free_calendars():
     week = date(2026, 9, 14)
-    busy_a = [
-        BusyInterval(
-            _at(week, 2, 11),
-            _at(week, 2, 13),
-        )
-    ]
-    busy_b = [
-        BusyInterval(
-            _at(week, 2, 15),
-            _at(week, 2, 16),
-        )
-    ]
+    busy_a = [BusyInterval(_at(week, 2, 11), _at(week, 2, 13))]
+    busy_b = [BusyInterval(_at(week, 2, 15), _at(week, 2, 16))]
     result = overlay([busy_a, busy_b], _at(week, 0, 9), _week_spec(week))
     wed_11 = next(cell for cell in result.cells if cell.day_index == 2 and cell.hour == 11)
     wed_14 = next(cell for cell in result.cells if cell.day_index == 2 and cell.hour == 14)
@@ -26,32 +17,47 @@ def test_overlay_counts_free_calendars():
     assert result.total == 2
 
 
-def test_suggest_slot_prefers_weekday_two_hours():
+def test_slot_start_marks_every_position_where_slot_fits():
     week = date(2026, 9, 14)
+    busy = [BusyInterval(_at(week, 2, 9), _at(week, 2, 12)), BusyInterval(_at(week, 2, 16), _at(week, 2, 21))]
     spec = _week_spec(week, slot_minutes=120)
-    cells = overlay([[], [], []], _at(week, 2, 10), spec).cells
-    slot = suggest_slot(cells, 3, _at(week, 0, 8), spec)
-    assert slot is not None
-    assert slot.start.weekday() < 5
-    duration = (slot.end - slot.start).total_seconds() / 3600
-    assert duration == 2
+    result = overlay([busy], _at(week, 0, 8), spec)
+    wednesday = [cell for cell in result.cells if cell.day_index == 2]
+    starts = [cell.hour for cell in wednesday if cell.slot_start]
+    covered = [cell.hour for cell in wednesday if cell.in_slot]
+    assert starts == [12, 13, 14]
+    assert covered == [12, 13, 14, 15]
 
 
-def test_busy_blocks_suggested_common_free():
+def test_slot_does_not_cross_busy_or_day_boundary():
     week = date(2026, 9, 14)
-    all_day_busy = [
-        BusyInterval(_at(week, day, 9), _at(week, day, 21))
-        for day in range(7)
-        if day != 2
-    ]
-    wed_busy = [
-        BusyInterval(_at(week, 2, 9), _at(week, 2, 14)),
-        BusyInterval(_at(week, 2, 17), _at(week, 2, 21)),
-    ]
-    result = overlay([all_day_busy + wed_busy], _at(week, 2, 9), _week_spec(week, slot_minutes=180))
-    assert result.suggested is not None
-    assert result.suggested.start == _at(week, 2, 14)
-    assert result.suggested.end == _at(week, 2, 17)
+    spec = _week_spec(week, slot_minutes=180)
+    result = overlay([[BusyInterval(_at(week, 0, 12), _at(week, 0, 13))]], _at(week, 0, 8), spec)
+    monday = [cell for cell in result.cells if cell.day_index == 0]
+    assert [cell.hour for cell in monday if cell.slot_start] == [9, 13, 14, 15, 16, 17, 18]
+    last = [cell for cell in result.cells if cell.day_index == 0][-1]
+    assert last.slot_start is False
+
+
+def test_slots_never_start_in_the_past():
+    week = date(2026, 9, 14)
+    result = overlay([[]], _at(week, 0, 15), _week_spec(week))
+    monday = [cell for cell in result.cells if cell.day_index == 0]
+    assert [cell.hour for cell in monday if cell.slot_start] == [15, 16, 17, 18, 19, 20]
+
+
+def test_no_participants_no_slots():
+    week = date(2026, 9, 14)
+    result = overlay([], _at(week, 0, 8), _week_spec(week))
+    assert not any(cell.slot_start or cell.in_slot for cell in result.cells)
+
+
+def test_overlapping_busy_intervals_are_merged():
+    week = date(2026, 9, 14)
+    busy = [BusyInterval(_at(week, 1, 10), _at(week, 1, 12)), BusyInterval(_at(week, 1, 11), _at(week, 1, 14))]
+    result = overlay([busy], _at(week, 0, 8), _week_spec(week))
+    tuesday = {cell.hour: cell.free_count for cell in result.cells if cell.day_index == 1}
+    assert [tuesday[hour] for hour in (9, 10, 11, 12, 13, 14)] == [1, 0, 0, 0, 0, 1]
 
 
 def test_overlay_respects_step_and_day_window():
@@ -68,11 +74,8 @@ def test_overlay_respects_step_and_day_window():
     assert {cell.day_index for cell in result.cells} == {0, 1, 2, 3, 4}
     monday = [cell for cell in result.cells if cell.day_index == 0]
     assert len(monday) == 8
-    assert monday[0].hour == 10
-    assert monday[0].minute == 0
-    assert monday[1].minute == 15
-    assert monday[-1].hour == 11
-    assert monday[-1].minute == 45
+    assert (monday[0].hour, monday[0].minute) == (10, 0)
+    assert (monday[-1].hour, monday[-1].minute) == (11, 45)
 
 
 def test_validate_grid_spec_rejects_inverted_range():
@@ -83,13 +86,35 @@ def test_validate_grid_spec_rejects_inverted_range():
         pass
 
 
-def test_suggest_slots_one_per_free_run():
+def test_overlay_uses_spec_timezone_for_cells():
+    # одно и то же занятое время 10:00–12:00 по Москве в Екатеринбурге (+2 ч) — это 12:00–14:00
     week = date(2026, 9, 14)
-    spec = _week_spec(week, slot_minutes=60)
-    result = overlay([[], []], _at(week, 0, 8), spec)
-    assert len(result.slots) == 7
-    assert result.suggested is not None
-    assert result.suggested.start == result.slots[0].start
+    busy = [BusyInterval(_at(week, 2, 10), _at(week, 2, 12))]
+    now = _at(week, 0, 8)
+    moscow = overlay([busy], now, _week_spec(week))
+    spec_ekb = GridSpec(
+        date_from=week,
+        date_to=week + timedelta(days=6),
+        time_start=time(9, 0),
+        time_end=time(21, 0),
+        step_minutes=60,
+        slot_minutes=60,
+        tz=ZoneInfo("Asia/Yekaterinburg"),
+    )
+    ekb = overlay([busy], now, spec_ekb)
+
+    def busy_hours(result):
+        return [cell.hour for cell in result.cells if cell.day_index == 2 and cell.free_count == 0]
+
+    assert busy_hours(moscow) == [10, 11]
+    assert busy_hours(ekb) == [12, 13]
+    ekb_cell = next(cell for cell in ekb.cells if cell.day_index == 2 and cell.hour == 12)
+    assert ekb_cell.start.utcoffset() == timedelta(hours=5)
+
+
+def test_default_spec_timezone_is_moscow():
+    assert _week_spec(date(2026, 9, 14)).tz == DomainConstants.DISPLAY_TZ
+    assert validate_grid_spec(date(2026, 9, 14), date(2026, 9, 15), "09:00", "18:00", 30, 60).tz == DomainConstants.DISPLAY_TZ
 
 
 def _week_spec(week: date, slot_minutes: int = 60) -> GridSpec:

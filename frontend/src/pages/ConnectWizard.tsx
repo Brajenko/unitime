@@ -1,9 +1,9 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { connectApple, fetchConnection, selectCollections } from "../api";
+import { connectApple, connectLink, fetchConnection, selectCollections } from "../api";
 import type { Connection } from "../types";
 
-type Step = "tiles" | "apple" | "select";
+type Step = "tiles" | "apple" | "link" | "select";
 
 export function ConnectWizard() {
   const [params] = useSearchParams();
@@ -15,6 +15,7 @@ export function ConnectWizard() {
   const [pending, setPending] = useState(false);
   const [email, setEmail] = useState("");
   const [appPassword, setAppPassword] = useState("");
+  const [linkUrl, setLinkUrl] = useState("");
 
   useEffect(() => {
     const connectionId = params.get("connection_id");
@@ -36,7 +37,16 @@ export function ConnectWizard() {
         <p className="eyebrow">ПОДКЛЮЧЕНИЕ</p>
         <h1 className="wizard-title">Подключить календарь</h1>
         {error ? <p className="error">{error}</p> : null}
-        {step === "tiles" ? <Tiles onApple={() => setStep("apple")} /> : null}
+        {step === "tiles" ? <Tiles onApple={() => setStep("apple")} onLink={() => setStep("link")} /> : null}
+        {step === "link" ? (
+          <LinkForm
+            url={linkUrl}
+            pending={pending}
+            onUrl={setLinkUrl}
+            onBack={() => setStep("tiles")}
+            onSubmit={(event) => submitLink(event, linkUrl, setPending, setError, setConnection, setSelected, setStep)}
+          />
+        ) : null}
         {step === "apple" ? (
           <AppleForm
             email={email}
@@ -63,10 +73,9 @@ export function ConnectWizard() {
   );
 }
 
-function Tiles({ onApple }: { onApple: () => void }) {
+function Tiles({ onApple, onLink }: { onApple: () => void; onLink: () => void }) {
   return (
     <div>
-      <p className="muted">Выберите сервис. Названия событий мы не сохраняем.</p>
       <div className="tiles">
         <a className="tile" href="/api/connections/google/start">
           Google
@@ -77,11 +86,42 @@ function Tiles({ onApple }: { onApple: () => void }) {
         <button type="button" className="tile" onClick={onApple}>
           Apple
         </button>
+        <button type="button" className="tile" onClick={onLink}>
+          Ссылка на календарь
+        </button>
       </div>
       <Link className="text-btn" to="/">
         Назад к сетке
       </Link>
     </div>
+  );
+}
+
+function LinkForm(props: {
+  url: string;
+  pending: boolean;
+  onUrl: (value: string) => void;
+  onBack: () => void;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return (
+    <form className="stack" onSubmit={props.onSubmit}>
+      <p className="muted">
+        Вставьте публичную ссылку на календарь.
+      </p>
+      <label className="field">
+        Ссылка (https:// или webcal://)
+        <input value={props.url} onChange={(event) => props.onUrl(event.target.value)} type="text" required />
+      </label>
+      <div className="row-actions">
+        <button type="button" className="text-btn" onClick={props.onBack}>
+          Назад
+        </button>
+        <button type="submit" className="primary" disabled={props.pending}>
+          {props.pending ? "Проверяем…" : "Продолжить"}
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -210,6 +250,28 @@ function submitApple(
   setPending(true);
   setError(null);
   connectApple(email, appPassword)
+    .then((payload) => {
+      setConnection(payload);
+      setSelected(new Set(payload.collections.filter((item) => item.selected).map((item) => item.id)));
+      setStep("select");
+    })
+    .catch((reason: Error) => setError(reason.message))
+    .finally(() => setPending(false));
+}
+
+function submitLink(
+  event: FormEvent,
+  url: string,
+  setPending: (value: boolean) => void,
+  setError: (value: string | null) => void,
+  setConnection: (value: Connection) => void,
+  setSelected: (value: Set<string>) => void,
+  setStep: (value: Step) => void,
+) {
+  event.preventDefault();
+  setPending(true);
+  setError(null);
+  connectLink(url)
     .then((payload) => {
       setConnection(payload);
       setSelected(new Set(payload.collections.filter((item) => item.selected).map((item) => item.id)));

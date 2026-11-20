@@ -7,7 +7,8 @@ export type GridCell = {
   total: number;
   start: string;
   end: string;
-  in_suggested: boolean;
+  slot_start: boolean;
+  in_slot: boolean;
 };
 
 export type GridSettings = {
@@ -19,23 +20,23 @@ export type GridSettings = {
   timeTo: string;
 };
 
-export type SuggestedSlot = {
-  start: string;
-  end: string;
-};
-
 export type GridResponse = {
   date_from: string;
   date_to: string;
   total: number;
   cells: GridCell[];
-  suggested: SuggestedSlot | null;
-  slots: SuggestedSlot[];
+  slot_minutes: number;
+  step_minutes: number;
   sources: Source[];
+  members: GridMember[];
+  team_id: string | null;
+  generated_at: string;
+  tz: string;
 };
 
 export type Source = {
   id: string;
+  connection_id: string;
   name: string;
   provider: string;
   selected: boolean;
@@ -63,4 +64,43 @@ export type ProviderInfo = {
   id: string;
   name: string;
   oauth: boolean;
+};
+
+export type User = {
+  id: string;
+  email: string;
+};
+
+export type TeamMember = {
+  user_id: string;
+  email: string;
+};
+
+export type Team = {
+  id: string;
+  name: string;
+  invite_token: string;
+  is_owner: boolean;
+  members: TeamMember[];
+};
+
+export type GridMember = {
+  user_id: string;
+  email: string;
+  calendars: number;
+  last_synced_at: string | null;
+  in_overlay: boolean;
+  status: MemberStatus;
+};
+
+export type MemberStatus = "ok" | "no_calendars" | "auth_failed" | "stale";
+
+export type Meeting = {
+  id: string;
+  team_id: string;
+  start: string;
+  end: string;
+  title: string | null;
+  created_by_email: string;
+  can_cancel: boolean;
 };
