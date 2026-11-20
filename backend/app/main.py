@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,8 +11,14 @@ from app.api.meetings import router as meetings_router
 from app.api.teams import router as teams_router
 
 
+@asynccontextmanager
+async def lifespan(_application: FastAPI):
+    settings.require_secret()
+    yield
+
+
 def create_app() -> FastAPI:
-    application = FastAPI(title="Slot availability")
+    application = FastAPI(title="Slot availability", lifespan=lifespan)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
