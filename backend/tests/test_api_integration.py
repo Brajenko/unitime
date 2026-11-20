@@ -24,7 +24,7 @@ def client(monkeypatch):
     with engine.begin() as connection:
         connection.execute(
             text(
-                "TRUNCATE busy_intervals, calendar_collections, calendar_connections, team_members, teams, app_users CASCADE"
+                "TRUNCATE meetings, busy_intervals, calendar_collections, calendar_connections, team_members, teams, app_users CASCADE"
             )
         )
     with TestClient(app) as test_client:
@@ -184,3 +184,102 @@ def test_delete_connection_removes_it_and_is_owner_only(client):
 
     with engine.connect() as connection:
         assert connection.execute(text("SELECT count(*) FROM busy_intervals")).scalar_one() == 0
+
+
+def _meeting_body(hour, minutes=60, title=None):
+    start = _tomorrow(hour)
+    body = {"start": start.isoformat(), "end": (start + timedelta(minutes=minutes)).isoformat()}
+    if title:
+        body["title"] = title
+    return body
+
+
+def _team_of_two(client):
+    alice, alice_id = _signup(client, "alice@example.com")
+    bob, bob_id = _signup(client, "bob@example.com")
+    team = alice.post("/api/teams", json={"name": "Проект"}).json()
+    bob.post("/api/teams/join", json={"invite_token": team["invite_token"]})
+    return alice, bob, team["id"]
+
+
+def test_meeting_create_and_list_visible_to_team(client):
+    alice, bob, team_id = _team_of_two(client)
+    outsider, _ = _signup(client, "carol@example.com")
+
+    created = alice.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(10, title="Синк"))
+    assert created.status_code == 201, created.text
+    assert created.json()["title"] == "Синк"
+    assert created.json()["created_by_email"] == "alice@example.com"
+
+    seen = bob.get(f"/api/teams/{team_id}/meetings")
+    assert seen.status_code == 200
+    assert [item["id"] for item in seen.json()] == [created.json()["id"]]
+    assert seen.json()[0]["can_cancel"] is False
+
+    assert outsider.get(f"/api/teams/{team_id}/meetings").status_code == 404
+    assert outsider.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(15)).status_code == 404
+
+
+def test_meeting_validation_errors_are_400(client):
+    alice, _, team_id = _team_of_two(client)
+    past = {"start": "2020-01-01T10:00:00+03:00", "end": "2020-01-01T11:00:00+03:00"}
+    assert alice.post(f"/api/teams/{team_id}/meetings", json=past).status_code == 400
+    assert alice.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(10, minutes=0)).status_code == 400
+
+
+def test_meeting_overlap_returns_409_but_adjacent_is_fine(client):
+    alice, bob, team_id = _team_of_two(client)
+    assert alice.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(10)).status_code == 201
+    clash = bob.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(10, minutes=30))
+    assert clash.status_code == 409
+    assert "занято" in clash.json()["detail"]
+    assert bob.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(11)).status_code == 201
+
+
+def test_meeting_overlap_is_per_team(client):
+    alice, _, team_id = _team_of_two(client)
+    other = alice.post("/api/teams", json={"name": "Другая"}).json()["id"]
+    assert alice.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(10)).status_code == 201
+    assert alice.post(f"/api/teams/{other}/meetings", json=_meeting_body(10)).status_code == 201
+
+
+def test_meeting_concurrent_fix_only_one_wins(client):
+    import threading
+
+    from sqlalchemy import text
+
+    from app.db import engine
+
+    alice, bob, team_id = _team_of_two(client)
+    barrier = threading.Barrier(2)
+    codes = []
+
+    def fix(user):
+        barrier.wait()
+        codes.append(user.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(10)).status_code)
+
+    threads = [threading.Thread(target=fix, args=(user,)) for user in (alice, bob)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(codes) == [201, 409]
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM meetings")).scalar_one() == 1
+
+
+def test_meeting_cancel_permissions(client):
+    alice, bob, team_id = _team_of_two(client)
+    carol, _ = _signup(client, "carol@example.com")
+    carol.post("/api/teams/join", json={"invite_token": alice.get("/api/teams").json()[0]["invite_token"]})
+
+    by_bob = bob.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(10)).json()["id"]
+    assert carol.delete(f"/api/meetings/{by_bob}").status_code == 403
+    assert alice.delete(f"/api/meetings/{by_bob}").status_code == 204
+    assert alice.delete(f"/api/meetings/{by_bob}").status_code == 404
+
+    by_alice = alice.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(12)).json()["id"]
+    assert bob.delete(f"/api/meetings/{by_alice}").status_code == 403
+    own = bob.post(f"/api/teams/{team_id}/meetings", json=_meeting_body(14)).json()["id"]
+    assert bob.delete(f"/api/meetings/{own}").status_code == 204
+    assert alice.get(f"/api/teams/{team_id}/meetings").json()[0]["can_cancel"] is True

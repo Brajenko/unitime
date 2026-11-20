@@ -5,6 +5,7 @@ from app.config import settings
 from app.api.auth import router as auth_router
 from app.api.connections import router as connections_router
 from app.api.grid import router as grid_router
+from app.api.meetings import router as meetings_router
 from app.api.teams import router as teams_router
 
 
@@ -21,6 +22,7 @@ def create_app() -> FastAPI:
     application.include_router(teams_router, prefix="/api")
     application.include_router(connections_router, prefix="/api")
     application.include_router(grid_router, prefix="/api")
+    application.include_router(meetings_router, prefix="/api")
 
     @application.get("/health")
     @application.get("/api/health")

@@ -106,3 +106,19 @@ class TeamOut(BaseModel):
 
 class LinkConnectIn(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
+
+
+class MeetingIn(BaseModel):
+    start: datetime
+    end: datetime
+    title: str | None = Field(default=None, max_length=200)
+
+
+class MeetingOut(BaseModel):
+    id: str
+    team_id: str
+    start: datetime
+    end: datetime
+    title: str | None
+    created_by_email: str
+    can_cancel: bool
