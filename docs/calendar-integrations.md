@@ -91,7 +91,7 @@ YANDEX_REDIRECT_URI=https://app.example.com/api/auth/yandex/callback
 1. Откройте `https://app.example.com/connect` → **Google**.
 2. Должен открыться аккаунт Google, затем согласие на список календарей и free/busy.
 3. После возврата выберите календари → **Подключить**.
-4. На сетке нажмите **Обновить**. Ошибка `google_config` значит, что на хосте пустые `GOOGLE_CLIENT_*`.
+4. Над сеткой нажмите **⟳ Обновить**. Ошибка `google_config` значит, что на хосте пустые `GOOGLE_CLIENT_*`.
 
 ---
 
@@ -124,7 +124,7 @@ ClientID и пароль приложения → `YANDEX_CLIENT_ID` / `YANDEX_C
 
 1. `https://app.example.com/connect` → **Яндекс**.
 2. Экран согласия Яндекса (не страница `?error=yandex_config`).
-3. Выбор календарей → **Подключить** → **Обновить** на сетке.
+3. Выбор календарей → **Подключить** → **⟳ Обновить** над сеткой.
 
 ---
 
@@ -186,6 +186,6 @@ POST https://app.example.com/api/connections/apple
 - [ ] После правки `.env`: `docker compose up -d --force-recreate api worker`
 - [ ] Плитки Google и Яндекс открывают экраны согласия провайдера
 - [ ] Apple принимает app-specific password и показывает список календарей
-- [ ] «Обновить» на сетке меняет занятость без `auth_failed`
+- [ ] «⟳ Обновить» над сеткой меняет занятость без `auth_failed`
 
 Локальные URI (`http://localhost:3000/...`) на проде не подставляйте. Их можно держать **дополнительными** в кабинетах Google и Яндекса для разработки.

@@ -19,9 +19,11 @@ import { cacheKey, clearGridCache, loadCachedGrid, saveCachedGrid } from "../gri
 import { memberSummary, missingNames } from "../members";
 import { meetingCellKeys } from "../meetings";
 import { slotPreview } from "../slots";
-import { BROWSER_TZ, clockIn, dayLabelIn } from "../tz";
-import type { AvailabilityWindow, GridCell, GridResponse, GridSettings, Meeting, Source, Team, User } from "../types";
+import { BROWSER_TZ, clockIn } from "../tz";
+import type { AvailabilityWindow, GridCell, GridMember, GridResponse, GridSettings, Meeting, Source, Team, User } from "../types";
+import { rangeLabel, shiftRange } from "../range";
 import { TeamPanel } from "./TeamPanel";
+import { TopBar } from "./TopBar";
 
 export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: () => void; teamKey: string }) {
   const [settings, setSettings] = useState(readSettings);
@@ -33,9 +35,9 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [hovered, setHovered] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number[]>([]);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [meetingsTick, setMeetingsTick] = useState(0);
-  const [pending, setPending] = useState<PendingMeeting | null>(null);
   const [meetingError, setMeetingError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [marking, setMarking] = useState(false);
@@ -142,8 +144,9 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   }, [teamId, meetingsTick]);
 
   useEffect(() => {
-    // разметка привязана к клеткам текущей сетки: при смене настроек выходим из режима
+    // выделение и разметка привязаны к клеткам текущей сетки: при смене настроек сбрасываем
     setMarking(false);
+    setSelected([]);
   }, [settings, teamId]);
 
   useEffect(() => {
@@ -157,12 +160,19 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   const cellsByKey = useMemo(() => indexCells(grid?.cells ?? []), [grid]);
   const timeKeys = useMemo(() => uniqueClocks(grid?.cells ?? []), [grid]);
   const days = useMemo(() => uniqueDays(grid?.cells ?? []), [grid]);
+  const slotLength = grid ? Math.round(grid.slot_minutes / grid.step_minutes) : 1;
   const preview = useMemo(() => {
-    if (!grid || hovered === null) {
+    if (!grid || marking) {
       return new Set<number>();
     }
-    return new Set(slotPreview(grid.cells, hovered, Math.round(grid.slot_minutes / grid.step_minutes)));
-  }, [grid, hovered]);
+    if (hovered !== null) {
+      const hoveredSlot = slotPreview(grid.cells, hovered, slotLength);
+      if (hoveredSlot.length > 0) {
+        return new Set(hoveredSlot);
+      }
+    }
+    return new Set(selected);
+  }, [grid, hovered, selected, slotLength, marking]);
   const slotRange = useMemo(() => {
     if (!grid || preview.size === 0) {
       return null;
@@ -172,7 +182,13 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   }, [grid, preview]);
   const meetingCells = useMemo(() => meetingCellKeys(grid?.cells ?? [], meetings), [grid, meetings]);
   const summary = useMemo(() => memberSummary(grid?.members ?? []), [grid]);
-  const canFix = teamId !== null;
+  const team = teams.find((item) => item.id === teamId) ?? null;
+  const me = grid?.members.find((member) => member.user_id === user.id) ?? null;
+
+  function refresh() {
+    refreshAll(settings, teamId, applyGrid, setError, setLoading);
+    setMeetingsTick((value) => value + 1);
+  }
 
   function startMarking() {
     if (!grid) {
@@ -180,7 +196,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
     }
     setMarkBusy(true);
     setMarkError(null);
-    setPending(null);
+    setSelected([]);
     fetchAvailability(settings)
       .then((windows) => {
         setMyOriginal(windows);
@@ -226,36 +242,32 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   }
 
   function pickSlot(index: number) {
-    if (marking || !grid || !teamId || index < 0) {
+    if (marking || !grid || index < 0) {
       return;
     }
-    const indexes = slotPreview(grid.cells, index, Math.round(grid.slot_minutes / grid.step_minutes));
-    if (indexes.length === 0) {
-      return;
-    }
-    if (indexes.some((item) => meetingCells.has(item))) {
-      setError("Это время уже занято встречей");
-      return;
-    }
-    const first = grid.cells[indexes[0]];
-    const last = grid.cells[indexes[indexes.length - 1]];
-    setError(null);
+    const indexes = slotPreview(grid.cells, index, slotLength);
     setMeetingError(null);
-    setPending({
-      start: first.start,
-      end: last.end,
-      label: `${dayLabelIn(first.start, grid.tz)}, ${clockIn(first.start, grid.tz)}–${clockIn(last.end, grid.tz)}`,
-    });
+    if (indexes.length === 0) {
+      setSelected([]);
+      return;
+    }
+    setSelected(indexes);
   }
 
-  function confirmMeeting(title: string) {
-    if (!pending || !teamId) {
+  function fixMeeting(title: string) {
+    if (!grid || !teamId || selected.length === 0) {
       return;
     }
+    if (selected.some((item) => meetingCells.has(item))) {
+      setMeetingError("Это время уже занято встречей");
+      return;
+    }
+    const first = grid.cells[selected[0]];
+    const last = grid.cells[selected[selected.length - 1]];
     setSaving(true);
-    createMeeting(teamId, pending.start, pending.end, title)
+    createMeeting(teamId, first.start, last.end, title)
       .then(() => {
-        setPending(null);
+        setSelected([]);
         setMeetingError(null);
         setMeetingsTick((value) => value + 1);
       })
@@ -273,7 +285,9 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   }
 
   const cellIndex = useMemo(() => new Map((grid?.cells ?? []).map((cell, index) => [cell, index])), [grid]);
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
   const hasSlots = (grid?.cells ?? []).some((cell) => cell.slot_start);
+  const hasCalendar = (grid?.sources.length ?? 0) > 0;
 
   const rowContext: RowContext = {
     cellsByKey,
@@ -281,43 +295,59 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
     preview,
     slotRange,
     meetingCells,
-    canFix: canFix && !marking,
+    canFix: !marking,
     marking,
     mine: myFree,
+    selected: selectedSet,
     onHover: setHovered,
     onPick: pickSlot,
     onPaint: paintCell,
     stepMinutes: settings.stepMinutes,
   };
-  const hasCalendar = (grid?.sources.length ?? 0) > 0;
 
   return (
     <div className="page">
       <div className="card">
+        <TopBar
+          user={user}
+          teams={teams}
+          teamId={teamId}
+          onSelect={setTeamId}
+          onCreated={(created) => {
+            setTeams((items) => [...items, created]);
+            setTeamId(created.id);
+          }}
+          onLogout={() => logout().finally(leave)}
+        />
         <div className="layout">
           <section>
-            <p className="eyebrow">СЕТКА</p>
-            <GridControls settings={settings} onChange={setSettings} />
+            <GridToolbar
+              settings={settings}
+              onChange={setSettings}
+              grid={grid}
+              loading={loading}
+              disabled={marking}
+              onRefresh={refresh}
+            />
             {error ? <p className="error">{error}</p> : null}
-            {teamId && summary.missing.length > 0 ? (
+            {marking ? (
+              <MarkBar
+                busy={markBusy}
+                hasCalendar={hasCalendar}
+                count={myFree.size}
+                error={markError}
+                onSave={saveMarking}
+                onClear={() => setMyFree(new Set())}
+                onCancel={() => {
+                  setMarking(false);
+                  setMarkError(null);
+                }}
+              />
+            ) : teamId && summary.missing.length > 0 ? (
               <p className="warning">
-                Сетка без учёта: {missingNames(summary)} — зелёные окна могут быть неверными
+                Без учёта: {missingNames(summary)} — зелёные окна могут быть неверными
               </p>
             ) : null}
-            <MarkPanel
-              marking={marking}
-              busy={markBusy || !grid}
-              hasCalendar={hasCalendar}
-              count={myFree.size}
-              error={markError}
-              onStart={startMarking}
-              onSave={saveMarking}
-              onClear={() => setMyFree(new Set())}
-              onCancel={() => {
-                setMarking(false);
-                setMarkError(null);
-              }}
-            />
             <div className={marking ? "grid-wrap marking" : "grid-wrap"}>
               <div
                 className="week-grid"
@@ -334,68 +364,39 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
                 {timeKeys.map((clock) => renderTimeRow(clock, days, rowContext))}
               </div>
             </div>
-            {marking ? null : <SlotStatus grid={grid} hasSlots={hasSlots} preview={preview} canFix={canFix} />}
-            {pending && !marking ? (
-              <MeetingConfirm
-                pending={pending}
+            {marking ? null : (
+              <SlotCard
+                grid={grid}
+                selected={selected}
+                hasSlots={hasSlots}
+                team={team}
                 saving={saving}
                 error={meetingError}
-                onConfirm={confirmMeeting}
-                onCancel={() => setPending(null)}
+                onFix={fixMeeting}
+                onClose={() => {
+                  setSelected([]);
+                  setMeetingError(null);
+                }}
               />
-            ) : null}
-            {grid ? (
-              <p className="muted data-age">
-                Данные от {clockIn(grid.generated_at, grid.tz)}
-                {loading ? " · обновляется…" : ""}
-              </p>
-            ) : null}
+            )}
           </section>
           <aside className="sidebar">
-            <p className="user-line">
-              {user.email}{" "}
-              <button
-                type="button"
-                className="text-btn"
-                onClick={() => logout().finally(leave)}
-              >
-                Выйти
-              </button>
-            </p>
+            <MyAvailability
+              sources={grid?.sources ?? []}
+              me={me}
+              loading={loading && !grid}
+              marking={marking}
+              busy={markBusy || !grid}
+              onMark={startMarking}
+              onRemove={(source) => removeSource(source, refresh, setError)}
+            />
             <TeamPanel
-              teams={teams}
-              teamId={teamId}
+              team={team}
               members={grid?.members ?? []}
               meetings={meetings}
               tz={grid?.tz ?? BROWSER_TZ}
               onCancelMeeting={removeMeeting}
-              onSelect={setTeamId}
-              onCreated={(team) => {
-                setTeams((items) => [...items, team]);
-                setTeamId(team.id);
-              }}
             />
-            <p className="eyebrow">МОИ КАЛЕНДАРИ</p>
-            {loading && !grid ? <p className="muted">Загрузка…</p> : null}
-            <SourceList
-              sources={grid?.sources ?? []}
-              onRemove={(source) => removeSource(source, () => refreshAll(settings, teamId, applyGrid, setError, setLoading), setError)}
-            />
-            <div className="sidebar-actions">
-              <Link className="primary-link" to="/connect">
-                Подключить календарь
-              </Link>
-              <button
-                type="button"
-                className="text-btn"
-                onClick={() => {
-                  refreshAll(settings, teamId, applyGrid, setError, setLoading);
-                  setMeetingsTick((value) => value + 1);
-                }}
-              >
-                Обновить
-              </button>
-            </div>
           </aside>
         </div>
       </div>
@@ -403,67 +404,106 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   );
 }
 
-function GridControls({
+function GridToolbar({
   settings,
   onChange,
+  grid,
+  loading,
+  disabled,
+  onRefresh,
 }: {
   settings: GridSettings;
   onChange: (value: GridSettings) => void;
+  grid: GridResponse | null;
+  loading: boolean;
+  disabled: boolean;
+  onRefresh: () => void;
 }) {
+  const [viewOpen, setViewOpen] = useState(false);
   function onFieldChange(event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) {
     applyControl(event, settings, onChange);
   }
+  function shift(direction: 1 | -1) {
+    onChange({ ...settings, ...shiftRange(settings.dateFrom, settings.dateTo, direction) });
+  }
   return (
-    <form className="grid-controls" onSubmit={preventSubmit}>
-      <label className="control">
-        Детализация
-        <select name="stepMinutes" value={settings.stepMinutes} onChange={onFieldChange}>
-          {Constants.STEP_OPTIONS.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="control">
-        Длительность слота
-        <select name="slotMinutes" value={settings.slotMinutes} onChange={onFieldChange}>
-          {slotDurationOptions(settings.stepMinutes).map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="control">
-        Даты
-        <span className="control-pair">
-          <input name="dateFrom" type="date" value={settings.dateFrom} onChange={onFieldChange} />
-          <span className="control-dash">—</span>
-          <input name="dateTo" type="date" value={settings.dateTo} onChange={onFieldChange} />
+    <div className="toolbar">
+      <div className="toolbar-row">
+        <span className="week-nav">
+          <button type="button" className="nav-btn" aria-label="Предыдущая неделя" disabled={disabled} onClick={() => shift(-1)}>
+            ←
+          </button>
+          <span className="week-label">{rangeLabel(settings.dateFrom, settings.dateTo)}</span>
+          <button type="button" className="nav-btn" aria-label="Следующая неделя" disabled={disabled} onClick={() => shift(1)}>
+            →
+          </button>
         </span>
-      </label>
-      <label className="control">
-        Время
-        <span className="control-pair">
-          <input
-            name="timeFrom"
-            type="time"
-            step={Constants.TIME_INPUT_STEP}
-            value={settings.timeFrom}
-            onChange={onFieldChange}
-          />
-          <span className="control-dash">—</span>
-          <input
-            name="timeTo"
-            type="time"
-            step={Constants.TIME_INPUT_STEP}
-            value={settings.timeTo}
-            onChange={onFieldChange}
-          />
+        <label className="control control-inline">
+          Встреча
+          <select name="slotMinutes" value={settings.slotMinutes} disabled={disabled} onChange={onFieldChange}>
+            {slotDurationOptions(settings.stepMinutes).map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button type="button" className="text-btn" onClick={() => setViewOpen((open) => !open)}>
+          ⚙ Вид
+        </button>
+        <span className="toolbar-fresh">
+          {grid ? `Данные от ${clockIn(grid.generated_at, grid.tz)}` : ""}
+          {loading ? " · обновляется…" : ""}
+          <button type="button" className="text-btn" onClick={onRefresh} disabled={loading}>
+            ⟳ Обновить
+          </button>
         </span>
-      </label>
-    </form>
+      </div>
+      {viewOpen ? (
+        <form className="grid-controls" onSubmit={preventSubmit}>
+          <label className="control">
+            Детализация
+            <select name="stepMinutes" value={settings.stepMinutes} disabled={disabled} onChange={onFieldChange}>
+              {Constants.STEP_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="control">
+            Даты
+            <span className="control-pair">
+              <input name="dateFrom" type="date" value={settings.dateFrom} disabled={disabled} onChange={onFieldChange} />
+              <span className="control-dash">—</span>
+              <input name="dateTo" type="date" value={settings.dateTo} disabled={disabled} onChange={onFieldChange} />
+            </span>
+          </label>
+          <label className="control">
+            Часы
+            <span className="control-pair">
+              <input
+                name="timeFrom"
+                type="time"
+                step={Constants.TIME_INPUT_STEP}
+                value={settings.timeFrom}
+                disabled={disabled}
+                onChange={onFieldChange}
+              />
+              <span className="control-dash">—</span>
+              <input
+                name="timeTo"
+                type="time"
+                step={Constants.TIME_INPUT_STEP}
+                value={settings.timeTo}
+                disabled={disabled}
+                onChange={onFieldChange}
+              />
+            </span>
+          </label>
+        </form>
+      ) : null}
+    </div>
   );
 }
 
@@ -480,34 +520,76 @@ function alignSlotMinutes(stepMinutes: number, slotMinutes: number): number {
   return next ?? options[options.length - 1] ?? stepMinutes;
 }
 
-function SlotStatus({
+function SlotCard({
   grid,
+  selected,
   hasSlots,
-  preview,
-  canFix,
+  team,
+  saving,
+  error,
+  onFix,
+  onClose,
 }: {
   grid: GridResponse | null;
+  selected: number[];
   hasSlots: boolean;
-  preview: Set<number>;
-  canFix: boolean;
+  team: Team | null;
+  saving: boolean;
+  error: string | null;
+  onFix: (title: string) => void;
+  onClose: () => void;
 }) {
+  const [title, setTitle] = useState("");
   if (!grid || grid.total === 0) {
     return null;
   }
-  if (!hasSlots) {
-    return <p className="muted">Нет общего свободного слота такой длительности</p>;
+  if (selected.length === 0) {
+    return (
+      <p className="muted slot-hint">
+        {hasSlots ? "Нажмите на зелёную клетку, чтобы выбрать слот" : "Нет общего свободного слота такой длительности"}
+      </p>
+    );
   }
-  if (preview.size === 0) {
-    return <p className="muted">Наведите на зелёную клетку, чтобы увидеть слот</p>;
-  }
-  const indexes = Array.from(preview).sort((left, right) => left - right);
-  const first = grid.cells[indexes[0]];
-  const last = grid.cells[indexes[indexes.length - 1]];
+  const first = grid.cells[selected[0]];
+  const last = grid.cells[selected[selected.length - 1]];
   return (
-    <p className="slot-switcher-label">
-      Слот: {formatCellDay(first)}, {clockIn(first.start, grid.tz)}–{clockIn(last.end, grid.tz)}
-      {canFix ? " · нажмите, чтобы зафиксировать" : ""}
-    </p>
+    <form
+      className="slot-card"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onFix(title);
+        setTitle("");
+      }}
+    >
+      <div className="slot-card-head">
+        <span className="slot-card-title">
+          Выбран слот: {formatCellDay(first)}, {clockIn(first.start, grid.tz)}–{clockIn(last.end, grid.tz)}
+        </span>
+        <button type="button" className="source-remove" aria-label="Снять выбор" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      <span className="muted">
+        Свободны {first.free_count} из {first.total}
+        {team ? "" : " · это только ваша занятость"}
+      </span>
+      {team ? (
+        <span className="slot-card-actions">
+          <input
+            value={title}
+            maxLength={200}
+            placeholder="Название встречи (необязательно)"
+            onChange={(event) => setTitle(event.target.value)}
+          />
+          <button type="submit" className="primary" disabled={saving}>
+            {saving ? "Сохраняем…" : "Зафиксировать встречу"}
+          </button>
+        </span>
+      ) : (
+        <span className="muted">Чтобы назначить встречу, выберите команду вверху.</span>
+      )}
+      {error ? <p className="error">{error}</p> : null}
+    </form>
   );
 }
 
@@ -567,8 +649,6 @@ function clampDates(settings: GridSettings): GridSettings {
   return next;
 }
 
-type PendingMeeting = { start: string; end: string; label: string };
-
 type RowContext = {
   cellsByKey: Map<string, GridCell>;
   cellIndex: Map<GridCell, number>;
@@ -578,52 +658,40 @@ type RowContext = {
   canFix: boolean;
   marking: boolean;
   mine: Set<number>;
+  selected: Set<number>;
   onHover: (index: number | null) => void;
   onPick: (index: number) => void;
   onPaint: (index: number, start: boolean) => void;
   stepMinutes: number;
 };
 
-function MarkPanel({
-  marking,
+function MarkBar({
   busy,
   hasCalendar,
   count,
   error,
-  onStart,
   onSave,
   onClear,
   onCancel,
 }: {
-  marking: boolean;
   busy: boolean;
   hasCalendar: boolean;
   count: number;
   error: string | null;
-  onStart: () => void;
   onSave: () => void;
   onClear: () => void;
   onCancel: () => void;
 }) {
-  if (!marking) {
-    return (
-      <p className="mark-panel">
-        <button type="button" className="secondary" disabled={busy} onClick={onStart}>
-          Отметить мои свободные окна
-        </button>
-      </p>
-    );
-  }
   return (
-    <div className="mark-panel mark-panel-active">
+    <div className="mark-bar">
       <p className="mark-hint">
-        Нажмите на клетку или выделите прямоугольник мышью, когда вы свободны. В днях, где отмечено хоть что-то,
-        остальное время считается занятым; дни без отметок команда не учитывает.
+        <strong>Мои свободные окна.</strong> Нажмите на клетку или выделите прямоугольник мышью. В днях, где отмечено
+        хоть что-то, остальное время считается занятым; дни без отметок команда не учитывает.
       </p>
       {hasCalendar ? (
         <p className="warning">У вас подключён календарь — сетка считается по нему, ручные окна не учитываются.</p>
       ) : null}
-      <span className="meeting-confirm-actions">
+      <span className="slot-card-actions">
         <button type="button" className="primary" disabled={busy} onClick={onSave}>
           {busy ? "Сохраняем…" : `Сохранить (${count})`}
         </button>
@@ -636,6 +704,49 @@ function MarkPanel({
       </span>
       {error ? <p className="error">{error}</p> : null}
     </div>
+  );
+}
+
+function MyAvailability({
+  sources,
+  me,
+  loading,
+  marking,
+  busy,
+  onMark,
+  onRemove,
+}: {
+  sources: Source[];
+  me: GridMember | null;
+  loading: boolean;
+  marking: boolean;
+  busy: boolean;
+  onMark: () => void;
+  onRemove: (source: Source) => void;
+}) {
+  const manual = me?.status === "manual";
+  const unknown = sources.length === 0 && !manual;
+  return (
+    <section className={unknown ? "panel-block panel-attention" : "panel-block"}>
+      <p className="eyebrow">МОЯ ЗАНЯТОСТЬ</p>
+      {loading ? <p className="muted">Загрузка…</p> : null}
+      {sources.length > 0 ? <SourceList sources={sources} onRemove={onRemove} /> : null}
+      {manual ? <p className="source-meta">Окна отмечены вручную</p> : null}
+      {unknown && !loading ? (
+        <p className="muted empty-note">
+          Сервис пока не знает, когда вы свободны. Подключите календарь или отметьте окна вручную.
+        </p>
+      ) : null}
+      <div className="panel-actions">
+        <Link className="secondary" to="/connect">
+          + Календарь
+        </Link>
+        <button type="button" className="secondary" disabled={busy || marking} onClick={onMark}>
+          ✎ Окна вручную
+        </button>
+      </div>
+      {sources.length > 0 ? <p className="source-meta">Календарь главнее ручных окон.</p> : null}
+    </section>
   );
 }
 
@@ -654,8 +765,8 @@ function renderTimeRow(clock: string, days: DayHeader[], context: RowContext) {
 }
 
 function renderCell(dayIndex: number, clock: string, cell: GridCell | undefined, index: number, context: RowContext) {
-  const kind = slotKind(cell, index, context.preview);
-  const meeting = context.meetingCells.get(index);
+  const kind = context.marking ? null : slotKind(cell, index, context.preview);
+  const meeting = context.marking ? undefined : context.meetingCells.get(index);
   const classes = ["cell"];
   if (kind === "active") {
     classes.push("in-slot");
@@ -668,6 +779,9 @@ function renderCell(dayIndex: number, clock: string, cell: GridCell | undefined,
   if (meeting) {
     classes.push("meeting");
   }
+  if (context.selected.has(index)) {
+    classes.push("selected");
+  }
   if (context.marking) {
     classes.push("markable");
     if (context.mine.has(index)) {
@@ -678,7 +792,11 @@ function renderCell(dayIndex: number, clock: string, cell: GridCell | undefined,
     <div
       key={`${dayIndex}-${clock}`}
       className={classes.join(" ")}
-      style={cellFillStyle(cell, kind, context.stepMinutes, meeting !== undefined)}
+      style={
+        context.marking
+          ? { ...rowItemStyle(context.stepMinutes), backgroundColor: Constants.CELL_BASE }
+          : cellFillStyle(cell, kind, context.stepMinutes, meeting !== undefined)
+      }
       onMouseEnter={() => {
         context.onHover(index >= 0 ? index : null);
         context.onPaint(index, false);
@@ -691,52 +809,10 @@ function renderCell(dayIndex: number, clock: string, cell: GridCell | undefined,
       }}
       onClick={() => context.onPick(index)}
     >
-      {cell ? (
+      {cell && !context.marking ? (
         <span className="cell-tip">{tooltipText(cell, kind === "active" ? context.slotRange : null, meeting)}</span>
       ) : null}
     </div>
-  );
-}
-
-function MeetingConfirm({
-  pending,
-  saving,
-  error,
-  onConfirm,
-  onCancel,
-}: {
-  pending: PendingMeeting;
-  saving: boolean;
-  error: string | null;
-  onConfirm: (title: string) => void;
-  onCancel: () => void;
-}) {
-  const [title, setTitle] = useState("");
-  return (
-    <form
-      className="meeting-confirm"
-      onSubmit={(event) => {
-        event.preventDefault();
-        onConfirm(title);
-      }}
-    >
-      <p className="meeting-confirm-title">Зафиксировать встречу: {pending.label}?</p>
-      <input
-        value={title}
-        maxLength={200}
-        placeholder="Название (необязательно)"
-        onChange={(event) => setTitle(event.target.value)}
-      />
-      <span className="meeting-confirm-actions">
-        <button type="submit" className="primary" disabled={saving}>
-          {saving ? "Сохраняем…" : "Зафиксировать"}
-        </button>
-        <button type="button" className="text-btn" onClick={onCancel}>
-          Отмена
-        </button>
-      </span>
-      {error ? <p className="error">{error}</p> : null}
-    </form>
   );
 }
 

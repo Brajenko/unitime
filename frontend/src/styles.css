@@ -262,12 +262,6 @@ a {
   border-color: #c44;
 }
 
-.sidebar-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
 .primary,
 .primary-link,
 .tile {
@@ -398,57 +392,15 @@ a {
   .grid-controls {
     flex-direction: column;
   }
-}
 
-.user-line {
-  margin: 0 0 12px;
-  font-size: 12px;
-  color: #555;
-}
+  .topbar,
+  .toolbar-row {
+    flex-wrap: wrap;
+  }
 
-.team-panel {
-  margin-bottom: 16px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--line);
-}
-
-.team-panel select,
-.team-panel input {
-  width: 100%;
-  margin-bottom: 8px;
-  padding: 6px 8px;
-  border: 1px solid #d0d0d0;
-  font: inherit;
-  font-size: 12px;
-}
-
-.team-create {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-
-.team-create input {
-  margin-bottom: 0;
-}
-
-.invite {
-  font-size: 11px;
-}
-
-.invite {
-  margin-bottom: 8px;
-}
-
-.invite-box {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  margin-top: 6px;
-}
-
-.invite-box input {
-  margin-bottom: 0;
+  .toolbar-fresh {
+    margin-left: 0;
+  }
 }
 
 .source-item {
@@ -483,11 +435,6 @@ a {
   font-size: 14px;
 }
 
-.data-age {
-  margin: 4px 0 0;
-  font-size: 12px;
-}
-
 .cell.pickable {
   cursor: pointer;
 }
@@ -501,60 +448,9 @@ a {
   border-color: #1d4ed8;
 }
 
-.member-summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  align-items: baseline;
-  margin: 12px 0 4px;
-  font-size: 13px;
-}
-
-.member-summary-warn {
-  color: #6b4a00;
-}
-
-.meetings {
-  margin-top: 12px;
-}
-
-.meeting-confirm {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 12px 0 0;
-  padding: 12px;
-  border: 1px solid #1d4ed8;
-  max-width: 520px;
-}
-
-.meeting-confirm-title {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.meeting-confirm-actions {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-
 .primary:disabled {
   opacity: 0.6;
   cursor: default;
-}
-
-.mark-panel {
-  margin: 8px 0;
-}
-
-.mark-panel-active {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  border: 1px solid #15803d;
 }
 
 .mark-hint {
@@ -598,4 +494,177 @@ a {
 .secondary:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* шапка: команда слева, пользователь справа */
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding-bottom: 16px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.topbar-team,
+.topbar-user,
+.team-create {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.team-select,
+.team-create input,
+.invite-input,
+.slot-card input {
+  border: 1px solid #d0d0d0;
+  background: #fff;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.team-select {
+  min-width: 220px;
+  font-weight: 500;
+}
+
+/* панель над сеткой */
+.toolbar {
+  margin-bottom: 12px;
+}
+
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 12px 20px;
+}
+
+.week-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.week-label {
+  min-width: 170px;
+  text-align: center;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.control-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.toolbar-fresh {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.toolbar .grid-controls {
+  margin: 12px 0 0;
+  padding: 12px;
+  background: #fafafa;
+  border: 1px solid var(--line);
+}
+
+/* карточка выбранного слота под сеткой */
+.slot-hint {
+  margin: 12px 0 0;
+  font-size: 13px;
+}
+
+.slot-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgb(var(--slot));
+  font-size: 13px;
+}
+
+.slot-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.slot-card-title {
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.slot-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.slot-card input {
+  flex: 1;
+  min-width: 200px;
+}
+
+.cell.selected {
+  box-shadow: inset 0 0 0 2px rgb(var(--slot));
+}
+
+/* режим разметки своих окон */
+.mark-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border: 1px solid #15803d;
+  background: #f0fdf4;
+}
+
+/* боковая панель: блоки «моя занятость», «команда», «встречи» */
+.panel-block + .panel-block {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.panel-block .source-list {
+  margin-bottom: 10px;
+}
+
+.panel-attention {
+  margin: -16px -16px 0;
+  padding: 16px;
+  background: #fff7e0;
+}
+
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.panel-actions .secondary {
+  text-decoration: none;
+  font-size: 13px;
+  padding: 6px 10px;
+}
+
+.invite-input {
+  width: 100%;
+  margin-top: 8px;
+  font-size: 12px;
 }
