@@ -1,4 +1,5 @@
-import type { Connection, GridResponse, GridSettings, ProviderInfo, Team, User } from "./types";
+import type { Connection, GridResponse, GridSettings, Meeting, ProviderInfo, Team, User } from "./types";
+import { BROWSER_TZ } from "./tz";
 
 export class UnauthorizedError extends Error {}
 
@@ -31,6 +32,7 @@ export function fetchGrid(settings: GridSettings, teamId: string | null = null):
     slot_minutes: String(settings.slotMinutes),
     time_from: settings.timeFrom,
     time_to: settings.timeTo,
+    tz: BROWSER_TZ,
   });
   if (teamId) {
     query.set("team_id", teamId);
@@ -100,6 +102,21 @@ export function createTeam(name: string): Promise<Team> {
 
 export function joinTeam(inviteToken: string): Promise<Team> {
   return request("/api/teams/join", { method: "POST", body: JSON.stringify({ invite_token: inviteToken }) });
+}
+
+export function fetchMeetings(teamId: string): Promise<Meeting[]> {
+  return request(`/api/teams/${teamId}/meetings`);
+}
+
+export function createMeeting(teamId: string, start: string, end: string, title: string): Promise<Meeting> {
+  return request(`/api/teams/${teamId}/meetings`, {
+    method: "POST",
+    body: JSON.stringify({ start, end, title: title.trim() || null }),
+  });
+}
+
+export function cancelMeeting(meetingId: string): Promise<void> {
+  return request(`/api/meetings/${meetingId}`, { method: "DELETE" });
 }
 
 export function connectLink(url: string): Promise<Connection> {

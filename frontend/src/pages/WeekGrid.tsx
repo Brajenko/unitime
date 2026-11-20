@@ -1,19 +1,53 @@
-import { ChangeEvent, CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, CSSProperties, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { deleteConnection, enqueueSync, fetchConnections, fetchGrid, fetchTeams, logout, UnauthorizedError } from "../api";
+import {
+  cancelMeeting,
+  createMeeting,
+  deleteConnection,
+  enqueueSync,
+  fetchConnections,
+  fetchGrid,
+  fetchMeetings,
+  fetchTeams,
+  logout,
+  UnauthorizedError,
+} from "../api";
+import { cacheKey, clearGridCache, loadCachedGrid, saveCachedGrid } from "../gridCache";
+import { memberSummary, missingNames } from "../members";
+import { meetingCellKeys } from "../meetings";
 import { slotPreview } from "../slots";
-import type { GridCell, GridResponse, GridSettings, Source, Team, User } from "../types";
+import { BROWSER_TZ, clockIn, dayLabelIn } from "../tz";
+import type { GridCell, GridResponse, GridSettings, Meeting, Source, Team, User } from "../types";
 import { TeamPanel } from "./TeamPanel";
 
 export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: () => void; teamKey: string }) {
   const [settings, setSettings] = useState(readSettings);
   const [teams, setTeams] = useState<Team[]>([]);
   const [teamId, setTeamId] = useState<string | null>(() => readStored(teamKey));
-  const [grid, setGrid] = useState<GridResponse | null>(null);
+  const [grid, setGrid] = useState<GridResponse | null>(() =>
+    loadCachedGrid(user.id, cacheKey(readStored(teamKey), readSettings(), BROWSER_TZ)),
+  );
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [hovered, setHovered] = useState<number | null>(null);
+  const [meetings, setMeetings] = useState<Meeting[]>([]);
+  const [meetingsTick, setMeetingsTick] = useState(0);
+  const [pending, setPending] = useState<PendingMeeting | null>(null);
+  const [meetingError, setMeetingError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const syncedRange = useRef<string | null>(null);
+  const gridKey = cacheKey(teamId, settings, BROWSER_TZ);
+  const applyGrid = useCallback(
+    (payload: GridResponse) => {
+      setGrid(payload);
+      saveCachedGrid(user.id, gridKey, payload);
+    },
+    [user.id, gridKey],
+  );
+  const leave = useCallback(() => {
+    clearGridCache();
+    onLogout();
+  }, [onLogout]);
 
   useEffect(() => {
     writeSettings(settings);
@@ -42,6 +76,11 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
 
   useEffect(() => {
     let cancelled = false;
+    const cached = loadCachedGrid(user.id, gridKey);
+    if (cached) {
+      setGrid(cached);
+    }
+    setLoading(true);
     const rangeKey = `${settings.dateFrom}:${settings.dateTo}`;
     const shouldSync = syncedRange.current !== rangeKey;
     const loader = shouldSync ? loadRange(settings, teamId) : fetchGrid(settings, teamId);
@@ -49,7 +88,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
       .then((payload) => {
         if (!cancelled) {
           syncedRange.current = rangeKey;
-          setGrid(payload);
+          applyGrid(payload);
           setError(null);
         }
       })
@@ -57,7 +96,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
         if (!cancelled) {
           setError(reason.message);
           if (reason instanceof UnauthorizedError) {
-            onLogout();
+            leave();
           }
         }
       })
@@ -69,7 +108,29 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
     return () => {
       cancelled = true;
     };
-  }, [settings, teamId, onLogout]);
+  }, [settings, teamId, user.id, gridKey, applyGrid, leave]);
+
+  useEffect(() => {
+    if (!teamId) {
+      setMeetings([]);
+      return undefined;
+    }
+    let cancelled = false;
+    fetchMeetings(teamId)
+      .then((items) => {
+        if (!cancelled) {
+          setMeetings(items);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMeetings([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [teamId, meetingsTick]);
 
   const cellsByKey = useMemo(() => indexCells(grid?.cells ?? []), [grid]);
   const timeKeys = useMemo(() => uniqueClocks(grid?.cells ?? []), [grid]);
@@ -85,10 +146,73 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
       return null;
     }
     const indexes = Array.from(preview).sort((left, right) => left - right);
-    return `${moscowClock(grid.cells[indexes[0]].start)}–${moscowClock(grid.cells[indexes[indexes.length - 1]].end)}`;
+    return `${clockIn(grid.cells[indexes[0]].start, grid.tz)}–${clockIn(grid.cells[indexes[indexes.length - 1]].end, grid.tz)}`;
   }, [grid, preview]);
+  const meetingCells = useMemo(() => meetingCellKeys(grid?.cells ?? [], meetings), [grid, meetings]);
+  const summary = useMemo(() => memberSummary(grid?.members ?? []), [grid]);
+  const canFix = teamId !== null;
+
+  function pickSlot(index: number) {
+    if (!grid || !teamId || index < 0) {
+      return;
+    }
+    const indexes = slotPreview(grid.cells, index, Math.round(grid.slot_minutes / grid.step_minutes));
+    if (indexes.length === 0) {
+      return;
+    }
+    if (indexes.some((item) => meetingCells.has(item))) {
+      setError("Это время уже занято встречей");
+      return;
+    }
+    const first = grid.cells[indexes[0]];
+    const last = grid.cells[indexes[indexes.length - 1]];
+    setError(null);
+    setMeetingError(null);
+    setPending({
+      start: first.start,
+      end: last.end,
+      label: `${dayLabelIn(first.start, grid.tz)}, ${clockIn(first.start, grid.tz)}–${clockIn(last.end, grid.tz)}`,
+    });
+  }
+
+  function confirmMeeting(title: string) {
+    if (!pending || !teamId) {
+      return;
+    }
+    setSaving(true);
+    createMeeting(teamId, pending.start, pending.end, title)
+      .then(() => {
+        setPending(null);
+        setMeetingError(null);
+        setMeetingsTick((value) => value + 1);
+      })
+      .catch((reason: Error) => setMeetingError(reason.message))
+      .finally(() => setSaving(false));
+  }
+
+  function removeMeeting(meeting: Meeting) {
+    if (!window.confirm("Отменить встречу?")) {
+      return;
+    }
+    cancelMeeting(meeting.id)
+      .then(() => setMeetingsTick((value) => value + 1))
+      .catch((reason: Error) => setError(reason.message));
+  }
+
   const cellIndex = useMemo(() => new Map((grid?.cells ?? []).map((cell, index) => [cell, index])), [grid]);
   const hasSlots = (grid?.cells ?? []).some((cell) => cell.slot_start);
+
+  const rowContext: RowContext = {
+    cellsByKey,
+    cellIndex,
+    preview,
+    slotRange,
+    meetingCells,
+    canFix,
+    onHover: setHovered,
+    onPick: pickSlot,
+    stepMinutes: settings.stepMinutes,
+  };
 
   return (
     <div className="page">
@@ -98,6 +222,11 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
             <p className="eyebrow">СЕТКА</p>
             <GridControls settings={settings} onChange={setSettings} />
             {error ? <p className="error">{error}</p> : null}
+            {teamId && summary.missing.length > 0 ? (
+              <p className="warning">
+                Сетка без учёта: {missingNames(summary)} — зелёные окна могут быть неверными
+              </p>
+            ) : null}
             <div className="grid-wrap">
               <div
                 className="week-grid"
@@ -111,12 +240,25 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
                     <span className="day-head-date">{day.label}</span>
                   </div>
                 ))}
-                {timeKeys.map((clock) =>
-                  renderTimeRow(clock, days, cellsByKey, cellIndex, preview, slotRange, setHovered, settings.stepMinutes),
-                )}
+                {timeKeys.map((clock) => renderTimeRow(clock, days, rowContext))}
               </div>
             </div>
-            <SlotStatus grid={grid} hasSlots={hasSlots} preview={preview} />
+            <SlotStatus grid={grid} hasSlots={hasSlots} preview={preview} canFix={canFix} />
+            {pending ? (
+              <MeetingConfirm
+                pending={pending}
+                saving={saving}
+                error={meetingError}
+                onConfirm={confirmMeeting}
+                onCancel={() => setPending(null)}
+              />
+            ) : null}
+            {grid ? (
+              <p className="muted data-age">
+                Данные от {clockIn(grid.generated_at, grid.tz)}
+                {loading ? " · обновляется…" : ""}
+              </p>
+            ) : null}
           </section>
           <aside className="sidebar">
             <p className="user-line">
@@ -124,7 +266,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
               <button
                 type="button"
                 className="text-btn"
-                onClick={() => logout().finally(onLogout)}
+                onClick={() => logout().finally(leave)}
               >
                 Выйти
               </button>
@@ -133,6 +275,9 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
               teams={teams}
               teamId={teamId}
               members={grid?.members ?? []}
+              meetings={meetings}
+              tz={grid?.tz ?? BROWSER_TZ}
+              onCancelMeeting={removeMeeting}
               onSelect={setTeamId}
               onCreated={(team) => {
                 setTeams((items) => [...items, team]);
@@ -143,7 +288,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
             {loading && !grid ? <p className="muted">Загрузка…</p> : null}
             <SourceList
               sources={grid?.sources ?? []}
-              onRemove={(source) => removeSource(source, () => refreshAll(settings, teamId, setGrid, setError, setLoading), setError)}
+              onRemove={(source) => removeSource(source, () => refreshAll(settings, teamId, applyGrid, setError, setLoading), setError)}
             />
             <div className="sidebar-actions">
               <Link className="primary-link" to="/connect">
@@ -152,7 +297,10 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
               <button
                 type="button"
                 className="text-btn"
-                onClick={() => refreshAll(settings, teamId, setGrid, setError, setLoading)}
+                onClick={() => {
+                  refreshAll(settings, teamId, applyGrid, setError, setLoading);
+                  setMeetingsTick((value) => value + 1);
+                }}
               >
                 Обновить
               </button>
@@ -245,10 +393,12 @@ function SlotStatus({
   grid,
   hasSlots,
   preview,
+  canFix,
 }: {
   grid: GridResponse | null;
   hasSlots: boolean;
   preview: Set<number>;
+  canFix: boolean;
 }) {
   if (!grid || grid.total === 0) {
     return null;
@@ -264,7 +414,8 @@ function SlotStatus({
   const last = grid.cells[indexes[indexes.length - 1]];
   return (
     <p className="slot-switcher-label">
-      Слот: {formatCellDay(first)}, {moscowClock(first.start)}–{moscowClock(last.end)}
+      Слот: {formatCellDay(first)}, {clockIn(first.start, grid.tz)}–{clockIn(last.end, grid.tz)}
+      {canFix ? " · нажмите, чтобы зафиксировать" : ""}
     </p>
   );
 }
@@ -325,49 +476,103 @@ function clampDates(settings: GridSettings): GridSettings {
   return next;
 }
 
-function renderTimeRow(
-  clock: string,
-  days: DayHeader[],
-  cellsByKey: Map<string, GridCell>,
-  cellIndex: Map<GridCell, number>,
-  preview: Set<number>,
-  slotRange: string | null,
-  onHover: (index: number | null) => void,
-  stepMinutes: number,
-) {
+type PendingMeeting = { start: string; end: string; label: string };
+
+type RowContext = {
+  cellsByKey: Map<string, GridCell>;
+  cellIndex: Map<GridCell, number>;
+  preview: Set<number>;
+  slotRange: string | null;
+  meetingCells: Map<number, Meeting>;
+  canFix: boolean;
+  onHover: (index: number | null) => void;
+  onPick: (index: number) => void;
+  stepMinutes: number;
+};
+
+function renderTimeRow(clock: string, days: DayHeader[], context: RowContext) {
   return (
     <div key={clock} className="contents-row">
-      <div className="hour-label" style={rowItemStyle(stepMinutes)}>
-        {formatClockLabel(clock, stepMinutes)}
+      <div className="hour-label" style={rowItemStyle(context.stepMinutes)}>
+        {formatClockLabel(clock, context.stepMinutes)}
       </div>
       {days.map((day) => {
-        const cell = cellsByKey.get(cellKey(day.index, clock));
-        return renderCell(day.index, clock, cell, cell ? cellIndex.get(cell) ?? -1 : -1, preview, slotRange, onHover, stepMinutes);
+        const cell = context.cellsByKey.get(cellKey(day.index, clock));
+        return renderCell(day.index, clock, cell, cell ? context.cellIndex.get(cell) ?? -1 : -1, context);
       })}
     </div>
   );
 }
 
-function renderCell(
-  dayIndex: number,
-  clock: string,
-  cell: GridCell | undefined,
-  index: number,
-  preview: Set<number>,
-  slotRange: string | null,
-  onHover: (index: number | null) => void,
-  stepMinutes: number,
-) {
-  const kind = slotKind(cell, index, preview);
+function renderCell(dayIndex: number, clock: string, cell: GridCell | undefined, index: number, context: RowContext) {
+  const kind = slotKind(cell, index, context.preview);
+  const meeting = context.meetingCells.get(index);
+  const classes = ["cell"];
+  if (kind === "active") {
+    classes.push("in-slot");
+    if (context.canFix) {
+      classes.push("pickable");
+    }
+  } else if (kind === "alt") {
+    classes.push("in-slot-alt");
+  }
+  if (meeting) {
+    classes.push("meeting");
+  }
   return (
     <div
       key={`${dayIndex}-${clock}`}
-      className={kind === "active" ? "cell in-slot" : kind === "alt" ? "cell in-slot-alt" : "cell"}
-      style={cellFillStyle(cell, kind, stepMinutes)}
-      onMouseEnter={() => onHover(index >= 0 ? index : null)}
+      className={classes.join(" ")}
+      style={cellFillStyle(cell, kind, context.stepMinutes, meeting !== undefined)}
+      onMouseEnter={() => context.onHover(index >= 0 ? index : null)}
+      onClick={() => context.onPick(index)}
     >
-      {cell ? <span className="cell-tip">{tooltipText(cell, kind === "active" ? slotRange : null)}</span> : null}
+      {cell ? (
+        <span className="cell-tip">{tooltipText(cell, kind === "active" ? context.slotRange : null, meeting)}</span>
+      ) : null}
     </div>
+  );
+}
+
+function MeetingConfirm({
+  pending,
+  saving,
+  error,
+  onConfirm,
+  onCancel,
+}: {
+  pending: PendingMeeting;
+  saving: boolean;
+  error: string | null;
+  onConfirm: (title: string) => void;
+  onCancel: () => void;
+}) {
+  const [title, setTitle] = useState("");
+  return (
+    <form
+      className="meeting-confirm"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onConfirm(title);
+      }}
+    >
+      <p className="meeting-confirm-title">Зафиксировать встречу: {pending.label}?</p>
+      <input
+        value={title}
+        maxLength={200}
+        placeholder="Название (необязательно)"
+        onChange={(event) => setTitle(event.target.value)}
+      />
+      <span className="meeting-confirm-actions">
+        <button type="submit" className="primary" disabled={saving}>
+          {saving ? "Сохраняем…" : "Зафиксировать"}
+        </button>
+        <button type="button" className="text-btn" onClick={onCancel}>
+          Отмена
+        </button>
+      </span>
+      {error ? <p className="error">{error}</p> : null}
+    </form>
   );
 }
 
@@ -559,13 +764,14 @@ function formatClockLabel(clock: string, stepMinutes: number): string {
   return "";
 }
 
-function tooltipText(cell: GridCell, slotRange: string | null): string {
+function tooltipText(cell: GridCell, slotRange: string | null, meeting?: Meeting): string {
   const from = cellClock(cell);
   const duration = Math.round((Date.parse(cell.end) - Date.parse(cell.start)) / Constants.MS_IN_MINUTE);
   const until = shiftClock(from, duration);
   const busy = cell.total - cell.free_count;
   const title = slotRange ? `Слот ${slotRange}` : `${from}–${until}`;
-  return `${title}\nСвободны: ${cell.free_count}/${cell.total}\nЗаняты: ${busy}`;
+  const base = `${title}\nСвободны: ${cell.free_count}/${cell.total}\nЗаняты: ${busy}`;
+  return meeting ? `Встреча: ${meeting.title ?? "без названия"}\n${base}` : base;
 }
 
 function providerLabel(provider: string): string {
@@ -617,6 +823,7 @@ function cellFillStyle(
   cell: GridCell | undefined,
   kind: "active" | "alt" | null,
   stepMinutes: number,
+  isMeeting: boolean,
 ): CSSProperties {
   const busyRatio = cell && cell.total > 0 ? (cell.total - cell.free_count) / cell.total : 0;
   const busyAlpha = busyRatio * Constants.BUSY_MAX_ALPHA;
@@ -629,6 +836,11 @@ function cellFillStyle(
   if (kind === "alt") {
     layers.unshift(
       `linear-gradient(rgba(${Constants.SLOT_RGB}, ${Constants.SLOT_ALT_ALPHA}), rgba(${Constants.SLOT_RGB}, ${Constants.SLOT_ALT_ALPHA}))`,
+    );
+  }
+  if (isMeeting) {
+    layers.unshift(
+      `linear-gradient(rgba(${Constants.MEETING_RGB}, ${Constants.MEETING_ALPHA}), rgba(${Constants.MEETING_RGB}, ${Constants.MEETING_ALPHA}))`,
     );
   }
   return {
@@ -646,18 +858,6 @@ function slotKind(cell: GridCell | undefined, index: number, preview: Set<number
     return "active";
   }
   return cell.in_slot ? "alt" : null;
-}
-
-function moscowClock(iso: string): string {
-  const parts = new Intl.DateTimeFormat("ru-RU", {
-    timeZone: "Europe/Moscow",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date(iso));
-  const hour = parts.find((part) => part.type === "hour")?.value ?? "00";
-  const minute = parts.find((part) => part.type === "minute")?.value ?? "00";
-  return `${hour}:${minute}`;
 }
 
 function readStored(key: string): string | null {
@@ -748,5 +948,7 @@ class Constants {
   static readonly BUSY_MAX_ALPHA = 0.6;
   static readonly SLOT_ALPHA = 0.55;
   static readonly SLOT_ALT_ALPHA = 0.18;
+  static readonly MEETING_RGB = "29, 78, 216";
+  static readonly MEETING_ALPHA = 0.5;
   static readonly CELL_BASE = "#f7f7f7";
 }

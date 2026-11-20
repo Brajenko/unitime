@@ -473,3 +473,74 @@ a {
 .source-remove:hover {
   color: #c33;
 }
+
+.warning {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid #e0b252;
+  background: #fff7e0;
+  color: #6b4a00;
+  font-size: 14px;
+}
+
+.data-age {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
+.cell.pickable {
+  cursor: pointer;
+}
+
+.cell.meeting {
+  box-shadow: inset 0 0 0 2px #1d4ed8;
+}
+
+.status-meeting {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+}
+
+.member-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+  margin: 12px 0 4px;
+  font-size: 13px;
+}
+
+.member-summary-warn {
+  color: #6b4a00;
+}
+
+.meetings {
+  margin-top: 12px;
+}
+
+.meeting-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 12px;
+  border: 1px solid #1d4ed8;
+  max-width: 520px;
+}
+
+.meeting-confirm-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.meeting-confirm-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

@@ -30,6 +30,8 @@ export type GridResponse = {
   sources: Source[];
   members: GridMember[];
   team_id: string | null;
+  generated_at: string;
+  tz: string;
 };
 
 export type Source = {
@@ -88,4 +90,17 @@ export type GridMember = {
   calendars: number;
   last_synced_at: string | null;
   in_overlay: boolean;
+  status: MemberStatus;
+};
+
+export type MemberStatus = "ok" | "no_calendars" | "auth_failed" | "stale";
+
+export type Meeting = {
+  id: string;
+  team_id: string;
+  start: string;
+  end: string;
+  title: string | null;
+  created_by_email: string;
+  can_cancel: boolean;
 };
