@@ -4,7 +4,7 @@
 
 На паре: Константин Барайщук.
 
-Код доступен в репозитории Unitime. [Постановка и статус](../../backend/app/api/connections.py) · [Воркер](../../backend/app/sync/tasks.py) · [Публикация в Redis](../../backend/app/sync/relay.py)
+Код доступен в [репозитории Unitime](https://github.com/Brajenko/unitime/tree/quest-8-worker). [Постановка и статус](../../backend/app/api/connections.py) · [Воркер](../../backend/app/sync/tasks.py) · [Публикация в Redis](../../backend/app/sync/relay.py)
 
 ## 1. Сценарий
 
