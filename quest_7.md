@@ -1,127 +1,100 @@
-# Квест 7 - миграция для фиксации слота
+# Квест 7. Миграции и резервное копирование
 
-Проект: Unitime - поиск общего времени встречи учебной команды.
-Дата занятия: 14.11.2026.
-Очно работал: Константин Барайщук. Репозиторий: https://github.com/Brajenko/unitime (ветка `quest-7-migrations`)
+Проект Unitime помогает учебной команде найти общее время для встречи. Дата 14.11.2026. Ветка `quest-7-migrations`.
 
-## Политика миграций
+## 1. Миграции базы данных
 
-СУБД - PostgreSQL 16; модели описаны в [`backend/app/models.py`](backend/app/models.py). Alembic читает их через [`backend/alembic/env.py`](backend/alembic/env.py). Ревизии хранятся в [`backend/alembic/versions/`](backend/alembic/versions/): `0001_initial` -> `0002_users_teams` -> [`0003_fixed_slots`](backend/alembic/versions/0003_fixed_slots.py). Порядок определяет `down_revision` внутри каждого файла. Ранее применённые файлы не меняем; следующая правка схемы получает новую ревизию.
+### Схема и инструменты
 
-Новая таблица `fixed_slots` хранит команду, автора, начало и конец встречи. Ограничение PostgreSQL `EXCLUDE USING gist` запрещает пересекающиеся интервалы в одной команде, в том числе при одновременных запросах. Соседние встречи допустимы благодаря интервалу `[)`. `btree_gist` нужен для сравнения UUID команды в GiST. `CHECK` запрещает пустой или обратный интервал и бесконечные даты. Откат удаляет таблицу и **все записи фиксаций**, поэтому его применяют лишь на тестовой БД или после отдельного бэкапа. Расширение при откате сохраняется: оно может использоваться другими объектами.
+Unitime использует PostgreSQL 16. Схема описана в [моделях SQLAlchemy](backend/app/models.py), а SQL для изменения таблиц выполняет [Alembic](backend/alembic/env.py). Порядок задаёт ссылка `down_revision` в файле каждой миграции. Текущая ревизия хранится в таблице `alembic_version`.
 
-Для будущих изменений сначала меняем модель, затем на актуальной *отдельной* базе выполняем `alembic revision --autogenerate -m "описание"`. Полученный файл проверяем вручную: `upgrade`, `downgrade`, `revision`, `down_revision`, ограничения и неожиданные удаления. Alembic не гарантирует автогенерацию специальных ограничений. Команды из каталога `backend`: `alembic history --verbose`, `alembic current`, `alembic heads`, `alembic show 0003_fixed_slots`, `alembic upgrade head`. `DATABASE_URL` должен явно указывать нужную БД: [`env.py`](backend/alembic/env.py) берёт адрес из окружения и перекрывает им `alembic.ini`.
+Ревизия `0001_initial` создаёт исходные таблицы пользователей и календарей. Следующая ревизия [`0002_users_teams`](backend/alembic/versions/0002_users_teams.py) добавляет поля `email` и `password_hash`, устанавливает уникальность email и создаёт таблицы `teams` и `team_members`.
 
-Alembic ведёт таблицу `alembic_version` с колонкой `version_num`: в линейной истории она содержит текущую ревизию. Успешное повторное `upgrade head` не применяет её снова. Перед выпуском ответственный участник команды проверяет новую ревизию на отдельной БД; при ошибке выпуск останавливается, состояние БД проверяется, исправление выпускается новой ревизией. Рабочий контейнер API сейчас сам выполняет `alembic upgrade head` при старте: сначала должен быть готов PostgreSQL, затем проходит миграция, затем запускается приложение. Поэтому **обычный `docker compose up` с этой веткой обновит основную БД `slot`**. Для квеста используется отдельный Compose-проект.
+### Применение и откат
 
-## Проверка на отдельной БД
-
-Команды выполняются из корня репозитория. Не запускайте интеграционный `pytest` с `RUN_INTEGRATION=1` против `slot`: существующий тест очищает таблицы. Если имя `slot_migration_test` уже занято, не удаляйте базу - используйте новое имя и замените его во всех командах.
+Для проверки создаётся база `slot_migration_test` в PostgreSQL проекта `unitime`. Она находится на том же сервере, что и штатная база `slot`. В новой базе ещё нет таблиц Unitime, поэтому исходная схема сначала создаётся ревизией `0001_initial`. Команды Docker Compose выполняются из корня репозитория.
 
 ```powershell
-docker compose up -d postgres
-docker compose exec -T postgres createdb -U slot slot_migration_test
-docker compose run --rm --no-deps --build -e DATABASE_URL=postgresql+psycopg://slot:slot@postgres:5432/slot_migration_test api alembic upgrade 0002_users_teams
-docker compose exec -T postgres psql -U slot -d slot_migration_test -c "SELECT version_num FROM alembic_version"
+docker compose -p unitime up -d --wait postgres
+docker compose -p unitime exec -T postgres createdb -U slot --template=template0 slot_migration_test
 ```
 
-Добавляем известного пользователя и команду в БД версии `0002`:
+Для проверки Alembic запускается в одноразовом контейнере сервиса `migrate`. Файл `.env` при первом запуске создают из `.env.example`. Параметр `DATABASE_URL` указывает на `slot_migration_test`. Если это имя уже занято, другое имя задают и в `createdb`, и в `DATABASE_URL`.
 
 ```powershell
-docker compose exec -T postgres psql -U slot -d slot_migration_test -v ON_ERROR_STOP=1 -c "INSERT INTO app_users(id,email,password_hash) VALUES ('00000000-0000-0000-0000-000000000001','quest7@example.test','test-only'); INSERT INTO teams(id,name,invite_token,owner_id) VALUES ('00000000-0000-0000-0000-000000000002','Quest 7 team','quest7-test-token','00000000-0000-0000-0000-000000000001'); INSERT INTO team_members(id,team_id,user_id) VALUES ('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001')"
-docker compose run --rm --no-deps -e DATABASE_URL=postgresql+psycopg://slot:slot@postgres:5432/slot_migration_test api alembic upgrade head
-docker compose run --rm --no-deps -e DATABASE_URL=postgresql+psycopg://slot:slot@postgres:5432/slot_migration_test api alembic upgrade head
-docker compose exec -T postgres psql -U slot -d slot_migration_test -c "SELECT version_num FROM alembic_version; SELECT id,email FROM app_users; SELECT id,name FROM teams; SELECT conname,contype FROM pg_constraint WHERE conrelid='fixed_slots'::regclass ORDER BY conname"
+docker compose -p unitime run --rm --no-deps --build -e "DATABASE_URL=postgresql+psycopg://slot:slot@postgres:5432/slot_migration_test" migrate sh
 ```
 
-Автоматическая проверка ограничений в контейнере API после `upgrade head`:
+В оболочке контейнера `upgrade` сначала создаёт исходную схему, затем применяет `0002`. После применения `alembic current` показывает `0002_users_teams`, а после `downgrade` показывает `0001_initial`. В конце `upgrade head` возвращает актуальную схему, и `alembic check` сверяет её с моделями.
+
+```sh
+alembic upgrade 0001_initial
+alembic upgrade 0002_users_teams
+alembic current
+alembic downgrade 0001_initial
+alembic current
+alembic upgrade head
+alembic check
+exit
+```
+
+### Подготовка и выпуск миграции
+
+После изменения модели на тестовой БД с актуальной схемой выполняют `alembic revision --autogenerate -m "описание"`. В полученной ревизии проверяют связь с предыдущей, а также операции в `upgrade()` и `downgrade()`. Затем миграцию применяют и откатывают на тестовых данных.
+
+Перед выпуском сохраняют дамп рабочей БД. При `docker compose up -d --build` сервис `migrate` выполняет `alembic upgrade head`. Compose запускает API после успешного завершения `migrate`. Alembic удерживает блокировку на соединении с БД. Второй запуск Alembic для той же БД сразу завершается с ошибкой, а ожидание блокировки таблицы ограничено пятью секундами.
+
+При ошибке журнал смотрят через `docker compose logs migrate`, а текущую ревизию проверяют через `alembic current`. Если транзакция `0002` завершается ошибкой, PostgreSQL откатывает её изменения. После устранения причины переход проверяют на тестовой базе и повторяют запуск Compose.
+
+Откат уже применённой `0002` до `0001` удаляет таблицы команд и участников, а также поля `email` и `password_hash`. Поэтому для рабочего отката заранее сохраняют копию, из которой можно вернуть эти данные.
+
+## 2. Резервное копирование
+
+| Параметр | Правило |
+| --- | --- |
+| Что копируется | Вся БД PostgreSQL, включая `alembic_version`. Прежний `APP_SECRET` хранят отдельно в защищённом хранилище. |
+| Когда и куда | Дамп создают вручную ежедневно в 03:00 МСК и хранят на отдельном от PostgreSQL диске. |
+| Срок хранения | Семь суток. Из просроченных копий скрипт сохраняет те, которые входят в две последние. |
+| Цели восстановления | До 24 часов потери данных (RPO) и до 2 часов на восстановление (RTO). |
+
+[Скрипт бэкапа](scripts/backup.py) запускается из корня репозитория. Для базы `slot` проекта `unitime` архив по умолчанию сохраняется в `backups/unitime/slot/`. Параметр `--directory` задаёт каталог на отдельном диске.
 
 ```powershell
-docker compose run --rm --no-deps -e DATABASE_URL=postgresql+psycopg://slot:slot@postgres:5432/slot_migration_test -e RUN_MIGRATION_TEST=1 api python -B -m pytest -q tests/test_fixed_slots_migration.py
+python scripts/backup.py --project unitime --database slot
 ```
 
-Проверка встреч: один слот 10–11, соседний 11–12 и слот другой команды с тем же временем принимаются; пересечение внутри команды отклоняется кодом `23P01`, неверный интервал - `23514`, неизвестный автор или команда - `23503`. Для одновременной проверки два соединения вставляют пересекающиеся встречи в одну команду: после подтверждения первой транзакции вторая получает `23P01`. В таблице остаётся одна из конфликтующих записей. Откат проверяется **только** на одноразовой тестовой БД командой `alembic downgrade 0002_users_teams`; затем `upgrade head` вновь создаёт пустую таблицу. Для проверки создания с нуля используйте вторую новую базу и `upgrade head`.
+Во время `pg_dump -Fc` PostgreSQL читает согласованный снимок. Записи, зафиксированные позже, в этот дамп не попадают. Если таблица занята операцией изменения схемы, `pg_dump` ждёт блокировку до 15 секунд. Повторный запуск бэкапа в тот же каталог возвращает код `75`.
 
-### Фактический результат
+Дамп записывается во временный файл. Скрипт синхронизирует его с диском и проверяет чтение всего архива через `pg_restore --file=-` без подключения к БД. После этого архив получает расширение `.dump` и начинается очистка. Код `3` означает, что архив сохранён, но очистка завершилась ошибкой. Восстановимость подтверждают загрузкой копии в отдельную БД.
 
-Проверено 14.11.2026 на отдельном временном контейнере PostgreSQL 16 с БД `slot_migration_test`. Основная БД `slot` не обновлялась.
+## 3. Восстановление
 
-- `alembic upgrade 0002_users_teams` создал исходную схему; перед новой миграцией добавлены пользователь, команда и участник.
-- `alembic upgrade head` применил `0003_fixed_slots`; повторный запуск завершился без изменений.
-- Исходные записи сохранились: по одному пользователю, команде и участнику. В БД есть `CHECK`, `EXCLUDE`, оба внешних ключа и первичный ключ таблицы `fixed_slots`.
-- `RUN_MIGRATION_TEST=1 python -B -m pytest -q tests/test_fixed_slots_migration.py` - `1 passed`. Приняты соседние интервалы и одинаковое время разных команд; отклонены пересечение в команде, обратный интервал и неизвестный автор.
-- `alembic check` - `No new upgrade operations detected`.
-- `alembic downgrade 0002_users_teams` и повторный `alembic upgrade head` завершились успешно. Откат удаляет записи из `fixed_slots`, поэтому проверялся только на тестовой БД.
+### Загрузка и сверка данных
 
-## Политика резервного копирования
-
-Копируем PostgreSQL целиком в custom-архив `pg_dump -Fc`: в нём находятся пользователи, команды, подключения календарей, интервалы занятости, фиксированные встречи и `alembic_version`. Пользовательских файлов вне БД сейчас нет. Шифрованные секреты подключений можно прочитать после восстановления только с прежним `APP_SECRET`; его и рабочий `.env` ответственный участник хранит отдельно от дампов и Git. Если в проекте появятся загружаемые файлы, потребуется копировать их вместе с БД в одном согласованном окне и проверять оба набора при восстановлении.
-
-Для текущего учебного сервиса выбираем **RPO 24 часа**: допустима потеря изменений не более чем за сутки. **RTO 2 часа**: за это время ответственный участник разворачивает PostgreSQL, восстанавливает архив, проверяет данные и запускает приложение. Частота — ежедневно в 03:00 по Москве. Срок хранения — 7 суток; скрипт сохраняет самую новую копию с корректной SHA-256 даже если она старше 7 суток. Это небольшая команда и сервис без непрерывных критичных операций; при реальных требованиях к сохранности частоту нужно повысить.
-
-Для будущего развёртывания: запуск по расписанию на сервере, директория на **другом сервере или диске** (например, защищённая сетевая папка `\\backup-host\unitime`), доступ только ответственным за эксплуатацию. Задача по расписанию должна сохранять код возврата и журнал; ненулевой код или отсутствие нового `BACKUP_OK` к утру сообщается ответственному участнику. Ответственный участник раз в месяц восстанавливает последнюю копию в отдельную пустую БД и сверяет известные записи и версию схемы. Очистка выполняется только после успешной копии и сначала в режиме просмотра. Внешнее хранилище, расписание и уведомления **пока не настроены**; локальная проверка создания, восстановления и очистки выполнена ниже. Дампы и файлы SHA-256 исключены из Git через [`.gitignore`](.gitignore).
-
-Команды выполняются из корня проекта на Windows с Python из `backend/.venv`. Для безопасного повторения используется отдельный Compose-проект `unitime-quest7-demo` с собственным томом и [дополнительным Compose-файлом](docker-compose.quest7.yml). Порт `55432` нужен только локальному Alembic. Если он занят, измените его в дополнительном файле и в `DATABASE_URL` ниже.
+[Скрипт восстановления](scripts/restore.py) сначала читает весь архив, затем создаёт `slot_recovered` и загружает данные одной транзакцией. Если имя занято, операция прерывается до загрузки. При ошибке SQL изменения откатываются. Скрипт сообщает имя созданной базы, состояние которой сверяют перед повторным запуском.
 
 ```powershell
-docker compose -f docker-compose.yml -f docker-compose.quest7.yml -p unitime-quest7-demo up -d postgres
-cd backend
-$env:DATABASE_URL='postgresql+psycopg://slot:slot@127.0.0.1:55432/slot'
-$env:PYTHONPATH=(Get-Location).Path
-.\.venv\Scripts\alembic.exe upgrade 0002_users_teams
-cd ..
+$dump = 'backups/unitime/slot/имя-архива.dump'
+python scripts/restore.py --project unitime --dump $dump --target slot_recovered
 ```
 
-Добавьте тестовые записи в БД версии `0002`, затем примените новую миграцию и проверьте версию:
+После восстановления ревизию, число строк и контрольные записи сверяют с состоянием на момент создания копии. Запрос выполняется в базе `slot_recovered`.
 
 ```powershell
-docker compose -p unitime-quest7-demo exec -T postgres psql -U slot -d slot -v ON_ERROR_STOP=1 -c "INSERT INTO app_users(id,email,password_hash) VALUES ('00000000-0000-0000-0000-000000000001','quest7@example.test','test-only'); INSERT INTO teams(id,name,invite_token,owner_id) VALUES ('00000000-0000-0000-0000-000000000002','Quest 7 team','quest7-test-token','00000000-0000-0000-0000-000000000001'); INSERT INTO team_members(id,team_id,user_id) VALUES ('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001')"
-cd backend
-.\.venv\Scripts\alembic.exe upgrade head
-.\.venv\Scripts\alembic.exe upgrade head
-cd ..
-docker compose -p unitime-quest7-demo exec -T postgres psql -U slot -d slot -c "SELECT version_num FROM alembic_version"
+docker compose -p unitime exec -T postgres psql -U slot -d slot_recovered -c "SELECT version_num FROM alembic_version; SELECT (SELECT count(*) FROM app_users) AS users, (SELECT count(*) FROM teams) AS teams, (SELECT count(*) FROM busy_intervals) AS intervals;"
 ```
 
-Известный слот для проверки восстановления (вставляется после `0003`):
+### Переключение рабочей базы
 
-```powershell
-docker compose -p unitime-quest7-demo exec -T postgres psql -U slot -d slot -c "INSERT INTO fixed_slots(id,team_id,created_by,starts_at,ends_at) VALUES ('00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001','2026-11-16 10:00+03','2026-11-16 11:00+03')"
-```
+Перед переключением останавливают запись и фоновые задачи. Адрес проверенной БД задают в `DATABASE_URL` для `migrate`, API, воркера и планировщика в секции `environment` файла [Compose](docker-compose.yml). Сервисы пересоздают с прежним `APP_SECRET`, чтобы сохранить доступ к данным подключённых календарей. После миграции проверяют вход, сетку, синхронизацию и запись в восстановленную БД.
 
-Скрипт [quest7_backup.py](scripts/quest7_backup.py) создаёт архив, проверяет его командой `pg_restore --list`, записывает SHA-256, восстанавливает **только в новую БД с именем `*_restore_test`**, а очистку сначала показывает без удаления. Для реальной эксплуатации вместо `backups/quest7-demo` укажите путь внешнего хранилища. Этот локальный каталог игнорируется Git.
+## 4. Результаты проверки
 
-```powershell
-backend\.venv\Scripts\python.exe -B scripts\quest7_backup.py backup --project unitime-quest7-demo --database slot --directory backups\quest7-demo
-$dump=(Get-ChildItem backups\quest7-demo\*.dump | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-backend\.venv\Scripts\python.exe -B scripts\quest7_backup.py restore --project unitime-quest7-demo --dump $dump --target slot_restore_test
-docker compose -p unitime-quest7-demo exec -T postgres psql -U slot -d slot_restore_test -c "SELECT version_num FROM alembic_version; SELECT id,email FROM app_users; SELECT id,name FROM teams; SELECT id,starts_at,ends_at FROM fixed_slots"
-backend\.venv\Scripts\python.exe -B scripts\quest7_backup.py prune --directory backups\quest7-retention-test --keep-days 7
-backend\.venv\Scripts\python.exe -B scripts\quest7_backup.py prune --directory backups\quest7-retention-test --keep-days 7 --apply
-```
+| Проверка | Наблюдение |
+| --- | --- |
+| Миграции и запуск API | На PostgreSQL 16.16 проверили переход на `0002`, откат до `0001` и повторное применение. При конфликте схема осталась на `0001`. Compose заблокировал запуск API после ошибки `migrate`. При конкурентном запуске вторая миграция остановилась, а первая завершилась по таймауту блокировки таблицы. |
+| Снимок и таймаут бэкапа | Пока создавался дамп, значения в двух таблицах изменили одной транзакцией с `10/10` на `20/20`. Из дампа восстановилось `10/10`. Второй бэкап в тот же каталог остановился. При отдельной проверке таймаута прежний архив сохранился. |
+| Проверка архива и очистка | Обрезанный дамп не получил расширение `.dump`. После успешного бэкапа остались две последние копии. При ошибке очистки скрипт сообщил путь к новому архиву, и тот остался доступен. |
+| Восстановление и переключение | В отдельном PostgreSQL совпали ревизия, количество строк и контрольные записи. Обрезанный архив отклонён до создания БД, занятая БД сохранилась, ошибка SQL при загрузке оставила новую БД пустой. После переключения приложения проверили вход, сетку и синхронизацию. Новая запись появилась только в восстановленной БД. |
 
-`restore` требует новую пустую БД и сам её создаёт. При повторе используйте новое имя, например `slot_second_restore_test`; скрипт не перезаписывает существующую БД. Для проверки очистки подготовьте копии с известным возрастом:
-
-```powershell
-$source=(Get-ChildItem backups\quest7-demo\*.dump | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-$target='backups\quest7-retention-test'
-New-Item -ItemType Directory -Force -Path $target | Out-Null
-$stamp=(Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-foreach ($pair in @(@('11111111',0),@('22222222',2),@('33333333',9))) {
-    $path=Join-Path $target "unitime-$stamp-$($pair[0]).dump"
-    Copy-Item -LiteralPath $source -Destination $path
-    Copy-Item -LiteralPath "$source.sha256" -Destination "$path.sha256"
-    (Get-Item -LiteralPath $path).LastWriteTimeUtc=(Get-Date).ToUniversalTime().AddDays(-[int]$pair[1])
-}
-```
-
-Теперь выполните обе команды `prune` из блока выше. Скрипт удаляет только архивы своего формата и их SHA-файлы, не трогает повреждённые или неизвестные файлы; если нет ни одной копии с корректной SHA-256, он не удаляет ничего.
-
-### Фактический результат проверки бэкапов — 14.11.2026
-
-- На изолированном Compose-проекте миграции `0001` → `0002` → `0003` применились к заполненной БД; повторный `upgrade head` ничего не изменил. `alembic_version.version_num = 0003_fixed_slots`.
-- `backup` создал `unitime-20261114T112404Z-5047e6d6.dump`, SHA-256 `6de3e689501cac6d95a93ecd6332375c308b84e49d687f91beae1b1bf8a7359f`. `pg_restore --list` успешно прочитал архив.
-- `restore` создал отдельную БД `slot_restore_test`. В ней проверены: пользователь `00000000-0000-0000-0000-000000000001` / `quest7@example.test`, команда `00000000-0000-0000-0000-000000000002` / `Quest 7 team`, один участник и слот `00000000-0000-0000-0000-000000000004` с временем 07:00–08:00 UTC (10:00–11:00 МСК). Версия миграции также `0003_fixed_slots`.
-- На тестовых копиях возрастом 0, 2 и 9 дней просмотр показал `KEEP`, `KEEP`, `WOULD_DELETE`. После `--apply`: `KEEP`, `KEEP`, `DELETE`; удалена только 9-дневная копия, две более свежие и их SHA-файлы остались. Исходный дамп не затронут.
-
-Для 3-минутной защиты покажите [миграцию](backend/alembic/versions/0003_fixed_slots.py), `SELECT version_num FROM alembic_version` в тестовой БД, запрос к `slot_restore_test` выше и вывод `prune` до/после. Тестовые дампы лежат только локально и не входят в репозиторий. Функция фиксации встречи в API и интерфейсе относится к следующей задаче, квест 7 требует схему и проверку её миграции.
+Все 38 тестов бэкенда прошли, включая шесть интеграционных.
