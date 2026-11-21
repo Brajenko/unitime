@@ -68,10 +68,21 @@ export function deleteConnection(connectionId: string): Promise<void> {
   return request(`/api/connections/${connectionId}`, { method: "DELETE" });
 }
 
-export function enqueueSync(connectionId: string, dateFrom: string, dateTo: string): Promise<{ ok: boolean }> {
+export function enqueueSync(
+  connectionId: string,
+  dateFrom: string,
+  dateTo: string,
+): Promise<{ ok: boolean; job_id: string }> {
   return request(`/api/connections/${connectionId}/sync?date_from=${dateFrom}&date_to=${dateTo}`, {
     method: "POST",
   });
+}
+
+export function fetchSyncJob(
+  connectionId: string,
+  jobId: string,
+): Promise<{ status: "queued" | "running" | "succeeded" | "failed" }> {
+  return request(`/api/connections/${connectionId}/sync/${jobId}`);
 }
 
 export function fetchMe(): Promise<User> {

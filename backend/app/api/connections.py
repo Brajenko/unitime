@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.adapters import google, yandex
@@ -14,9 +15,12 @@ from app.config import settings
 from app.api.deps import current_user
 from app.db import get_db
 from app.domain import Constants as DomainConstants
-from app.models import AppUser, Provider
+from app.models import AppUser, CalendarConnection, Provider, SyncJob, SyncStatus
 from app.adapters.link import LinkError
-from app.schemas import AppleConnectIn, ConnectionOut, LinkConnectIn, SelectCollectionsIn
+from app.schemas import (
+    AppleConnectIn, ConnectionOut, LinkConnectIn, SelectCollectionsIn,
+    SyncAccepted, SyncJobOut, SyncResult,
+)
 from app.services import oauth_state
 from app.services.connections import (
     create_apple_connection,
@@ -27,7 +31,6 @@ from app.services.connections import (
     list_connections,
     select_collections,
 )
-from app.sync.tasks import sync_connection_task
 
 router = APIRouter()
 
@@ -138,11 +141,11 @@ def remove_connection(connection_id: uuid.UUID, user: AppUser = Depends(current_
         raise HTTPException(status_code=404, detail="Подключение не найдено") from error
 
 
-@router.post("/connections/{connection_id}/sync")
+@router.post("/connections/{connection_id}/sync", response_model=SyncAccepted)
 def enqueue_sync(
     connection_id: uuid.UUID,
-    date_from: str | None = Query(default=None),
-    date_to: str | None = Query(default=None),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
     user: AppUser = Depends(current_user),
     db: Session = Depends(get_db),
 ):
@@ -151,10 +154,44 @@ def enqueue_sync(
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Подключение не найдено") from error
     today = datetime.now(DomainConstants.DISPLAY_TZ).date()
-    start = date_from or today.isoformat()
-    end = date_to or (date.fromisoformat(start) + timedelta(days=DomainConstants.DEFAULT_RANGE_DAYS - 1)).isoformat()
-    sync_connection_task.delay(str(connection_id), start, end)
-    return {"ok": True}
+    start = date_from or today
+    end = date_to or start + timedelta(days=DomainConstants.DEFAULT_RANGE_DAYS - 1)
+    if end < start:
+        raise HTTPException(status_code=400, detail="Дата окончания раньше даты начала")
+    job = SyncJob(connection_id=connection_id, date_from=start, date_to=end)
+    db.add(job)
+    db.flush()
+    accepted = SyncAccepted(job_id=str(job.id))
+    db.commit()
+    return accepted
+
+
+@router.get("/connections/{connection_id}/sync/{job_id}", response_model=SyncJobOut)
+def sync_status(
+    connection_id: uuid.UUID,
+    job_id: uuid.UUID,
+    user: AppUser = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.scalar(
+        select(SyncJob)
+        .join(CalendarConnection)
+        .where(
+            SyncJob.id == job_id,
+            SyncJob.connection_id == connection_id,
+            CalendarConnection.user_id == user.id,
+        )
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задание не найдено")
+    result = None
+    if job.status == SyncStatus.SUCCEEDED:
+        result = SyncResult(last_synced_at=job.finished_at, interval_count=job.interval_count)
+    return SyncJobOut(
+        job_id=str(job.id), status=job.status, attempts=job.attempts,
+        process_count=job.process_count, result=result,
+        error=job.error if job.status == SyncStatus.FAILED else None,
+    )
 
 
 def _oauth_callback(provider: str, code: str | None, state: str | None, error: str | None, db, exchange) -> RedirectResponse:
