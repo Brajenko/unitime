@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, LargeBinary, String, Text, UniqueConstraint, Uuid, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint, Uuid, func
 from sqlalchemy.dialects.postgresql import TSTZRANGE
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,6 +29,13 @@ class ConnectionStatus(StrEnum):
     ACTIVE = "active"
     AUTH_FAILED = "auth_failed"
     SYNCING = "syncing"
+
+
+class SyncStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
 
 
 class AppUser(Base):
@@ -88,6 +95,28 @@ class CalendarConnection(Base):
         back_populates="connection",
         cascade="all, delete-orphan",
     )
+
+
+class SyncJob(Base):
+    __tablename__ = "sync_jobs"
+    __table_args__ = (Index("ix_sync_jobs_dispatch", "status", "available_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("calendar_connections.id", ondelete="CASCADE"), index=True
+    )
+    date_from: Mapped[date] = mapped_column(Date)
+    date_to: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(16), default=SyncStatus.QUEUED)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
+    process_count: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    interval_count: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
 
 
 class CalendarCollection(Base):

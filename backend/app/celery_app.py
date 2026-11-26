@@ -9,6 +9,13 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Europe/Moscow",
     enable_utc=True,
+    broker_transport_options={
+        "visibility_timeout": settings.sync_visibility_timeout,
+        "socket_connect_timeout": 3,
+        "socket_timeout": 5,
+    },
+    result_backend_transport_options={"visibility_timeout": settings.sync_visibility_timeout},
+    visibility_timeout=settings.sync_visibility_timeout,
 )
 
 celery_app.autodiscover_tasks(["app.sync"])

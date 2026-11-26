@@ -123,7 +123,7 @@ def delete_connection(session: Session, connection_id: uuid.UUID, user_id: uuid.
     cache.bump_user(user_id)
 
 
-def save_secret(session: Session, connection: CalendarConnection, secret: dict) -> None:
+def save_secret(connection: CalendarConnection, secret: dict) -> None:
     connection.encrypted_secret = secret_box.encrypt(secret)
 
 
@@ -131,7 +131,7 @@ def load_secret(connection: CalendarConnection) -> dict:
     return secret_box.decrypt(connection.encrypted_secret)
 
 
-def refresh_if_needed(session: Session, connection: CalendarConnection, secret: dict) -> dict:
+def refresh_if_needed(provider: str, secret: dict) -> dict:
     expires_at = secret.get("expires_at")
     refresh_token = secret.get("refresh_token")
     if not expires_at or not refresh_token:
@@ -139,20 +139,19 @@ def refresh_if_needed(session: Session, connection: CalendarConnection, secret: 
     moment = datetime.fromisoformat(expires_at)
     if moment - timedelta(seconds=Constants.REFRESH_SKEW_SECONDS) > datetime.now(timezone.utc):
         return secret
-    if connection.provider == Provider.GOOGLE:
+    if provider == Provider.GOOGLE:
         payload = google.refresh_access(refresh_token)
-    elif connection.provider == Provider.YANDEX:
+    elif provider == Provider.YANDEX:
         payload = yandex.refresh_access(refresh_token)
     else:
         return secret
-    secret["access_token"] = payload["access_token"]
+    secret = {**secret, "access_token": payload["access_token"]}
     if payload.get("refresh_token"):
         secret["refresh_token"] = payload["refresh_token"]
     if payload.get("expires_in"):
         secret["expires_at"] = (
             datetime.now(timezone.utc) + timedelta(seconds=int(payload["expires_in"]))
         ).isoformat()
-    save_secret(session, connection, secret)
     return secret
 
 
@@ -162,7 +161,7 @@ def replace_busy_window(
     window_start: datetime,
     window_end: datetime,
     occurrences,
-) -> None:
+) -> int:
     window = Range(window_start, window_end, bounds="[)")
     session.execute(
         delete(BusyIntervalRow).where(
@@ -189,6 +188,7 @@ def replace_busy_window(
             )
         )
     session.flush()
+    return len(seen)
 
 
 def _discover_into(session: Session, connection: CalendarConnection, secret: dict) -> None:

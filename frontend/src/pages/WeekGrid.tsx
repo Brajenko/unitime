@@ -1,6 +1,8 @@
 import { ChangeEvent, CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { deleteConnection, enqueueSync, fetchConnections, fetchGrid, fetchTeams, logout, UnauthorizedError } from "../api";
+import {
+  deleteConnection, enqueueSync, fetchConnections, fetchGrid, fetchSyncJob, fetchTeams, logout, UnauthorizedError,
+} from "../api";
 import { slotPreview } from "../slots";
 import type { GridCell, GridResponse, GridSettings, Source, Team, User } from "../types";
 import { TeamPanel } from "./TeamPanel";
@@ -422,30 +424,23 @@ function removeSource(source: Source, reload: () => void, setError: (value: stri
     .catch((reason: Error) => setError(reason.message));
 }
 
-function loadRange(settings: GridSettings, teamId: string | null): Promise<GridResponse> {
-  return fetchConnections().then((connections) => {
-    if (connections.length === 0) {
-      return fetchGrid(settings, teamId);
+async function loadRange(settings: GridSettings, teamId: string | null): Promise<GridResponse> {
+  const connections = await fetchConnections();
+  const jobs = await Promise.all(connections.map(async (connection) => {
+    const accepted = await enqueueSync(connection.id, settings.dateFrom, settings.dateTo).catch(() => undefined);
+    return accepted && { connectionId: connection.id, jobId: accepted.job_id };
+  }));
+  const acceptedJobs = jobs.filter((job) => job !== undefined);
+  for (let attempt = 0; attempt < 8 && acceptedJobs.length > 0; attempt++) {
+    const states = await Promise.all(acceptedJobs.map(({ connectionId, jobId }) =>
+      fetchSyncJob(connectionId, jobId).catch(() => undefined),
+    ));
+    if (!states.some((job) => job?.status === "queued" || job?.status === "running")) {
+      break;
     }
-    const jobs = connections.map((item) =>
-      enqueueSync(item.id, settings.dateFrom, settings.dateTo).catch(() => undefined),
-    );
-    return Promise.all(jobs).then(() => delay(400).then(() => waitForGrid(settings, teamId)));
-  });
-}
-
-function waitForGrid(settings: GridSettings, teamId: string | null): Promise<GridResponse> {
-  return pollGrid(settings, teamId, 0);
-}
-
-function pollGrid(settings: GridSettings, teamId: string | null, attempt: number): Promise<GridResponse> {
-  return fetchGrid(settings, teamId).then((payload) => {
-    const syncing = payload.sources.some((item) => item.status === "syncing");
-    if (!syncing || attempt >= 8) {
-      return payload;
-    }
-    return delay(500).then(() => pollGrid(settings, teamId, attempt + 1));
-  });
+    await delay(500);
+  }
+  return fetchGrid(settings, teamId);
 }
 
 function delay(ms: number): Promise<void> {

@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     public_url: str = "http://localhost:3000"
     sync_interval_seconds: int = 900
+    sync_visibility_timeout: int = 3600
+    sync_on_worker_start: bool = True
     grid_cache_enabled: bool = True
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
 

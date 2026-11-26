@@ -15,6 +15,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -69,6 +72,21 @@ services:
         condition: service_started
     command: celery -A app.celery_app:celery_app worker --loglevel=info
 
+  relay:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://slot:slot@postgres:5432/slot
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    command: python -m app.sync.relay
+
   beat:
     build:
       context: ./backend
@@ -94,3 +112,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:

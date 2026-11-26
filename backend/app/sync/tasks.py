@@ -2,65 +2,203 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from time import sleep
 
 import httpx
-from httpx import HTTPStatusError
-from sqlalchemy import select
-
-from app.adapters import apple, google, link, yandex
-from app.adapters.caldav_client import CalDavAuthError
+from celery.exceptions import Reject
 from celery.signals import worker_ready
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import InterfaceError, OperationalError
 
+from app.adapters import BusyOccurrence, apple, google, link, yandex
+from app.adapters.caldav_client import CalDavAuthError
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import SessionLocal
 from app.domain import Constants as DomainConstants
-from app.models import CalendarConnection, ConnectionStatus, Provider
+from app.models import CalendarConnection, ConnectionStatus, Provider, SyncJob, SyncStatus
 from app.services import cache
-from app.services.connections import get_connection, load_secret, refresh_if_needed, replace_busy_window
+from app.services.connections import get_connection, load_secret, refresh_if_needed, replace_busy_window, save_secret
 
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="sync_connection", bind=True)
-def sync_connection_task(self, connection_id: str, date_from: str, date_to: str) -> None:
-    session = SessionLocal()
+@dataclass(frozen=True)
+class Attempt:
+    job_id: uuid.UUID
+    connection_id: uuid.UUID
+    start: date
+    end: date
+    number: int
+    retries: int
+
+
+@dataclass
+class CalendarSnapshot:
+    encrypted_secret: bytes
+    refreshed_secret: dict | None
+    window_start: datetime
+    window_end: datetime
+    occurrences: dict[uuid.UUID, list[BusyOccurrence]]
+
+
+@celery_app.task(
+    name="sync_calendar_job", bind=True, acks_late=True, reject_on_worker_lost=True, ignore_result=True,
+)
+def sync_connection_task(self, job_id: str, retries: int) -> None:
+    worker = self.request.hostname
+    redelivered = str(bool(self.request.delivery_info.get("redelivered"))).lower()
     try:
-        connection = get_connection(session, uuid.UUID(connection_id))
-        connection.status = ConnectionStatus.SYNCING
-        connection.last_error = None
-        session.commit()
-        cache.bump_user(connection.user_id)
-        secret = refresh_if_needed(session, connection, load_secret(connection))
-        start = date.fromisoformat(date_from)
-        end = date.fromisoformat(date_to)
-        window_start = datetime.combine(start, datetime.min.time(), tzinfo=DomainConstants.DISPLAY_TZ)
-        window_end = datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=DomainConstants.DISPLAY_TZ)
-        for collection in connection.collections:
-            if not collection.selected:
-                continue
-            occurrences = _fetch(connection.provider, secret, collection.external_id, window_start, window_end)
-            replace_busy_window(session, collection, window_start, window_end, occurrences)
+        attempt = _start_attempt(uuid.UUID(job_id), retries, worker, redelivered)
+        if attempt is None:
+            return
+        try:
+            snapshot = _collect_calendar(attempt)
+            applied = _save_result(attempt, snapshot)
+        except (OperationalError, InterfaceError):
+            raise
+        except Exception as error:
+            _record_failure(attempt, error)
+        else:
+            outcome = "committed" if applied else "superseded"
+            logger.info("%s job_id=%s attempt=%s worker=%s", outcome, job_id, attempt.number, worker)
+    except (OperationalError, InterfaceError) as error:
+        logger.warning(
+            "requeue_database job_id=%s worker=%s error=%s", job_id, worker, type(error).__name__
+        )
+        sleep(Constants.DATABASE_REQUEUE_DELAY_SECONDS)
+        raise Reject(error, requeue=True) from error
+
+
+def _start_attempt(job_id: uuid.UUID, retries: int, worker: str, redelivered: str) -> Attempt | None:
+    duplicate_user = None
+    attempt = None
+    with SessionLocal.begin() as session:
+        job = session.get(SyncJob, job_id, with_for_update=True)
+        if job is None:
+            logger.info("missing job_id=%s worker=%s", job_id, worker)
+            return None
+        if job.status in (SyncStatus.SUCCEEDED, SyncStatus.FAILED):
+            logger.info(
+                "duplicate job_id=%s attempt=%s worker=%s redelivered=%s",
+                job.id, job.attempts, worker, redelivered,
+            )
+            if job.status == SyncStatus.SUCCEEDED:
+                duplicate_user = session.scalar(
+                    select(CalendarConnection.user_id).where(CalendarConnection.id == job.connection_id)
+                )
+        elif job.retries != retries:
+            logger.info("superseded job_id=%s worker=%s", job.id, worker)
+            return None
+        else:
+            connection = session.get(CalendarConnection, job.connection_id, with_for_update=True)
+            job.attempts += 1
+            job.status = SyncStatus.RUNNING
+            job.activity_at = datetime.now(timezone.utc)
+            connection.status = ConnectionStatus.SYNCING
+            connection.last_error = None
+            attempt = Attempt(job.id, job.connection_id, job.date_from, job.date_to, job.attempts, retries)
+            user_id = connection.user_id
+    if duplicate_user is not None:
+        cache.bump_user(duplicate_user)
+    if attempt is None:
+        return None
+    cache.bump_user(user_id)
+    logger.info(
+        "running job_id=%s attempt=%s worker=%s redelivered=%s",
+        job_id, attempt.number, worker, redelivered,
+    )
+    return attempt
+
+
+def _collect_calendar(attempt: Attempt) -> CalendarSnapshot:
+    with SessionLocal() as session:
+        connection = get_connection(session, attempt.connection_id)
+        provider = connection.provider
+        encrypted_secret = connection.encrypted_secret
+        old_secret = load_secret(connection)
+        selected = [(item.id, item.external_id) for item in connection.collections if item.selected]
+    secret = refresh_if_needed(provider, old_secret)
+    window_start = datetime.combine(attempt.start, datetime.min.time(), tzinfo=DomainConstants.DISPLAY_TZ)
+    window_end = datetime.combine(
+        attempt.end + timedelta(days=1), datetime.min.time(), tzinfo=DomainConstants.DISPLAY_TZ
+    )
+    occurrences = {
+        collection_id: _fetch(provider, secret, external_id, window_start, window_end)
+        for collection_id, external_id in selected
+    }
+    return CalendarSnapshot(
+        encrypted_secret, secret if secret is not old_secret else None, window_start, window_end, occurrences,
+    )
+
+
+def _owns_attempt(job: SyncJob | None, attempt: Attempt) -> bool:
+    return job is not None and job.status == SyncStatus.RUNNING and job.attempts == attempt.number
+
+
+def _save_result(attempt: Attempt, snapshot: CalendarSnapshot) -> bool:
+    with SessionLocal.begin() as session:
+        job = session.get(SyncJob, attempt.job_id, with_for_update=True)
+        if not _owns_attempt(job, attempt):
+            return False
+        connection = session.get(CalendarConnection, attempt.connection_id, with_for_update=True)
+        if snapshot.refreshed_secret is not None and connection.encrypted_secret == snapshot.encrypted_secret:
+            save_secret(connection, snapshot.refreshed_secret)
+        job.interval_count = sum(
+            replace_busy_window(
+                session, collection, snapshot.window_start, snapshot.window_end, snapshot.occurrences[collection.id]
+            )
+            for collection in connection.collections
+            if collection.selected and collection.id in snapshot.occurrences
+        )
+        finished_at = datetime.now(timezone.utc)
         connection.status = ConnectionStatus.ACTIVE
-        connection.last_synced_at = datetime.now(tz=DomainConstants.DISPLAY_TZ)
-        session.commit()
-        cache.bump_user(connection.user_id)
-    except link.LinkError as error:
-        session.rollback()
-        _mark_failed(session, connection_id, str(error), auth_failed=True)
-    except (CalDavAuthError, HTTPStatusError) as error:
-        session.rollback()
-        if _is_transient(error):
-            _mark_failed(session, connection_id, "Провайдер временно недоступен", auth_failed=False)
-            raise self.retry(exc=error, countdown=backoff_seconds(self.request.retries), max_retries=Constants.MAX_RETRIES)
-        _mark_failed(session, connection_id, str(error), auth_failed=True)
-    except Exception as error:
-        logger.exception("sync failed for %s", connection_id)
-        session.rollback()
-        _mark_failed(session, connection_id, "Не удалось обновить календарь", auth_failed=False)
-        raise self.retry(exc=error, countdown=backoff_seconds(self.request.retries), max_retries=Constants.MAX_RETRIES)
-    finally:
-        session.close()
+        connection.last_error = None
+        connection.last_synced_at = finished_at
+        user_id = connection.user_id
+        job.status = SyncStatus.SUCCEEDED
+        job.finished_at = finished_at
+        job.process_count += 1
+    cache.bump_user(user_id)
+    return True
+
+
+def _record_failure(attempt: Attempt, error: Exception) -> None:
+    auth_failed = isinstance(error, (link.LinkError, CalDavAuthError, httpx.HTTPStatusError)) and not _is_transient(error)
+    if isinstance(error, link.LinkError):
+        message = str(error)
+    elif auth_failed:
+        message = "Не удалось получить доступ к календарю"
+    elif _is_transient(error):
+        message = "Провайдер временно недоступен"
+    else:
+        logger.exception("calendar_error job_id=%s attempt=%s", attempt.job_id, attempt.number)
+        message = "Не удалось обновить календарь"
+    with SessionLocal.begin() as session:
+        job = session.get(SyncJob, attempt.job_id, with_for_update=True)
+        if not _owns_attempt(job, attempt):
+            return
+        connection = session.get(CalendarConnection, attempt.connection_id, with_for_update=True)
+        connection.status = ConnectionStatus.AUTH_FAILED if auth_failed else ConnectionStatus.ACTIVE
+        connection.last_error = message[:2000]
+        job.error = connection.last_error
+        user_id = connection.user_id
+        now = datetime.now(timezone.utc)
+        if not auth_failed and job.retries < Constants.MAX_RETRIES:
+            job.available_at = now + timedelta(seconds=backoff_seconds(job.retries))
+            job.retries += 1
+            job.status = SyncStatus.QUEUED
+            job.published_at = None
+            job.activity_at = now
+        else:
+            job.status = SyncStatus.FAILED
+            job.finished_at = now
+        outcome = job.status
+    cache.bump_user(user_id)
+    logger.info("%s job_id=%s attempt=%s", outcome, attempt.job_id, attempt.number)
 
 
 def _fetch(provider: str, secret: dict, external_id: str, window_start: datetime, window_end: datetime):
@@ -73,57 +211,63 @@ def _fetch(provider: str, secret: dict, external_id: str, window_start: datetime
     return apple.fetch_busy(secret, external_id, window_start, window_end)
 
 
-def _mark_failed(session, connection_id: str, message: str, auth_failed: bool) -> None:
+@celery_app.task(name="sync_connection", bind=True, acks_late=True, reject_on_worker_lost=True, ignore_result=True)
+def import_queued_sync(self, connection_id: str, date_from: str, date_to: str) -> None:
+    """Move deliveries published by a previous version to the durable queue."""
     try:
-        connection = get_connection(session, uuid.UUID(connection_id))
-        connection.status = ConnectionStatus.AUTH_FAILED if auth_failed else ConnectionStatus.ACTIVE
-        connection.last_error = message[:2000]
-        session.commit()
-        cache.bump_user(connection.user_id)
-    except Exception:
-        session.rollback()
+        with SessionLocal.begin() as session:
+            connection = session.get(
+                CalendarConnection, uuid.UUID(connection_id), with_for_update={"read": True, "key_share": True}
+            )
+            if connection is not None:
+                session.execute(
+                    insert(SyncJob).values(
+                        id=uuid.UUID(self.request.id), connection_id=connection.id,
+                        date_from=date.fromisoformat(date_from), date_to=date.fromisoformat(date_to),
+                    ).on_conflict_do_nothing(index_elements=[SyncJob.id])
+                )
+    except (OperationalError, InterfaceError) as error:
+        sleep(Constants.DATABASE_REQUEUE_DELAY_SECONDS)
+        raise Reject(error, requeue=True) from error
 
 
 @celery_app.task(name="sync_all_connections")
 def sync_all_connections_task() -> int:
-    """Периодический опрос: у CalDAV нет push, поэтому тянем окно на две недели раз в интервал."""
-    session = SessionLocal()
-    try:
+    """Периодический опрос активных подключений на две недели."""
+    with SessionLocal.begin() as session:
         ids = list(
             session.scalars(
-                select(CalendarConnection.id).where(CalendarConnection.status == ConnectionStatus.ACTIVE)
+                select(CalendarConnection.id)
+                .where(CalendarConnection.status == ConnectionStatus.ACTIVE)
+                .with_for_update(read=True, key_share=True)
             )
         )
-    finally:
-        session.close()
-    today = datetime.now(DomainConstants.DISPLAY_TZ).date()
-    end = today + timedelta(days=DomainConstants.MAX_RANGE_DAYS - 1)
-    for connection_id in ids:
-        sync_connection_task.delay(str(connection_id), today.isoformat(), end.isoformat())
+        today = datetime.now(DomainConstants.DISPLAY_TZ).date()
+        end = today + timedelta(days=DomainConstants.MAX_RANGE_DAYS - 1)
+        session.add_all(SyncJob(connection_id=item, date_from=today, date_to=end) for item in ids)
     return len(ids)
 
 
 @worker_ready.connect
 def _sync_on_worker_start(**_kwargs) -> None:
-    """beat после рестарта ждёт полный интервал; синкаем сразу, чтобы данные не устаревали после выкладки."""
-    sync_all_connections_task.delay()
+    if settings.sync_on_worker_start:
+        sync_all_connections_task.delay()
 
 
 def backoff_seconds(retries: int) -> int:
-    """Экспоненциальная задержка между повторами: 30 с, 60 с, 120 с, ... не больше 15 минут."""
+    """Экспоненциальная задержка между повторами, не больше 15 минут."""
     return min(Constants.BACKOFF_BASE_SECONDS * (2**retries), Constants.BACKOFF_MAX_SECONDS)
 
 
 def _is_transient(error: Exception) -> bool:
-    if isinstance(error, HTTPStatusError):
+    if isinstance(error, httpx.HTTPStatusError):
         code = error.response.status_code
         return code == 429 or code >= 500
-    if isinstance(error, httpx.TransportError):
-        return True
-    return False
+    return isinstance(error, httpx.TransportError)
 
 
 class Constants:
     MAX_RETRIES = 4
     BACKOFF_BASE_SECONDS = 30
     BACKOFF_MAX_SECONDS = 900
+    DATABASE_REQUEUE_DELAY_SECONDS = 2

@@ -4,6 +4,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.models import SyncStatus
+
 
 class CollectionOut(BaseModel):
     id: str
@@ -22,6 +24,25 @@ class ConnectionOut(BaseModel):
 
 class SelectCollectionsIn(BaseModel):
     selected_ids: list[str]
+
+
+class SyncAccepted(BaseModel):
+    ok: bool = True
+    job_id: str
+
+
+class SyncResult(BaseModel):
+    last_synced_at: datetime
+    interval_count: int
+
+
+class SyncJobOut(BaseModel):
+    job_id: str
+    status: SyncStatus
+    attempts: int
+    process_count: int
+    result: SyncResult | None
+    error: str | None
 
 
 class AppleConnectIn(BaseModel):
