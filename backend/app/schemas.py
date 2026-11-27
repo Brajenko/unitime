@@ -80,6 +80,7 @@ class MemberOut(BaseModel):
     calendars: int
     last_synced_at: datetime | None
     in_overlay: bool
+    status: str
 
 
 class GridOut(BaseModel):
@@ -92,6 +93,8 @@ class GridOut(BaseModel):
     sources: list[SourceOut]
     members: list[MemberOut]
     team_id: str | None = None
+    generated_at: datetime
+    tz: str
 
 
 class CredentialsIn(BaseModel):
@@ -127,3 +130,28 @@ class TeamOut(BaseModel):
 
 class LinkConnectIn(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
+
+
+class MeetingIn(BaseModel):
+    start: datetime
+    end: datetime
+    title: str | None = Field(default=None, max_length=200)
+
+
+class MeetingOut(BaseModel):
+    id: str
+    team_id: str
+    start: datetime
+    end: datetime
+    title: str | None
+    created_by_email: str
+    can_cancel: bool
+
+
+class AvailabilityWindowIO(BaseModel):
+    start: datetime
+    end: datetime
+
+
+class AvailabilityIn(BaseModel):
+    windows: list[AvailabilityWindowIO] = Field(default_factory=list)

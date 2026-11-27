@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -26,6 +27,17 @@ from app.services.connections import get_connection, load_secret, refresh_if_nee
 logger = logging.getLogger(__name__)
 
 
+class Constants:
+    MAX_RETRIES = 4
+    BACKOFF_BASE_SECONDS = 30
+    BACKOFF_MAX_SECONDS = 900
+    DATABASE_REQUEUE_DELAY_SECONDS = 2
+    SOFT_TIME_LIMIT_SECONDS = 50
+    TIME_LIMIT_SECONDS = 60
+    SPREAD_SHARE = 0.8
+    SPREAD_JITTER = 0.1
+
+
 @dataclass(frozen=True)
 class Attempt:
     job_id: uuid.UUID
@@ -47,6 +59,8 @@ class CalendarSnapshot:
 
 @celery_app.task(
     name="sync_calendar_job", bind=True, acks_late=True, reject_on_worker_lost=True, ignore_result=True,
+    soft_time_limit=Constants.SOFT_TIME_LIMIT_SECONDS,
+    time_limit=Constants.TIME_LIMIT_SECONDS,
 )
 def sync_connection_task(self, job_id: str, retries: int) -> None:
     worker = self.request.hostname
@@ -242,9 +256,19 @@ def sync_all_connections_task() -> int:
                 .with_for_update(read=True, key_share=True)
             )
         )
-        today = datetime.now(DomainConstants.DISPLAY_TZ).date()
+        now = datetime.now(timezone.utc)
+        today = now.astimezone(DomainConstants.DISPLAY_TZ).date()
         end = today + timedelta(days=DomainConstants.MAX_RANGE_DAYS - 1)
-        session.add_all(SyncJob(connection_id=item, date_from=today, date_to=end) for item in ids)
+        delays = spread_countdowns(len(ids), settings.sync_interval_seconds)
+        session.add_all(
+            SyncJob(
+                connection_id=connection_id,
+                date_from=today,
+                date_to=end,
+                available_at=now + timedelta(seconds=delay),
+            )
+            for connection_id, delay in zip(ids, delays)
+        )
     return len(ids)
 
 
@@ -252,6 +276,18 @@ def sync_all_connections_task() -> int:
 def _sync_on_worker_start(**_kwargs) -> None:
     if settings.sync_on_worker_start:
         sync_all_connections_task.delay()
+
+
+def spread_countdowns(count: int, interval_seconds: int) -> list[float]:
+    """Разносит постановку `count` задач по первым 80% интервала, чтобы пачка не забивала воркер.
+
+    Шаг равномерный, к каждой задержке добавлен случайный сдвиг до ±10% шага (порядок не нарушается).
+    """
+    if count <= 0:
+        return []
+    step = interval_seconds * Constants.SPREAD_SHARE / count
+    jitter = step * Constants.SPREAD_JITTER
+    return [max(0.0, index * step + random.uniform(-jitter, jitter)) for index in range(count)]
 
 
 def backoff_seconds(retries: int) -> int:
@@ -264,10 +300,3 @@ def _is_transient(error: Exception) -> bool:
         code = error.response.status_code
         return code == 429 or code >= 500
     return isinstance(error, httpx.TransportError)
-
-
-class Constants:
-    MAX_RETRIES = 4
-    BACKOFF_BASE_SECONDS = 30
-    BACKOFF_MAX_SECONDS = 900
-    DATABASE_REQUEUE_DELAY_SECONDS = 2
