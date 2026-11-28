@@ -1,21 +1,65 @@
-import { ChangeEvent, CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, CSSProperties, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  deleteConnection, enqueueSync, fetchConnections, fetchGrid, fetchSyncJob, fetchTeams, logout, UnauthorizedError,
+  cancelMeeting,
+  createMeeting,
+  deleteConnection,
+  enqueueSync,
+  fetchAvailability,
+  fetchConnections,
+  fetchGrid,
+  fetchMeetings,
+  fetchSyncJob,
+  fetchTeams,
+  logout,
+  saveAvailability,
+  UnauthorizedError,
 } from "../api";
+import { paintRect, windowsForSave, windowsToCellSet } from "../availability";
+import { cacheKey, clearGridCache, loadCachedGrid, saveCachedGrid } from "../gridCache";
+import { memberSummary, missingNames } from "../members";
+import { meetingCellKeys } from "../meetings";
 import { slotPreview } from "../slots";
-import type { GridCell, GridResponse, GridSettings, Source, Team, User } from "../types";
+import { BROWSER_TZ, clockIn } from "../tz";
+import type { AvailabilityWindow, GridCell, GridMember, GridResponse, GridSettings, Meeting, Source, Team, User } from "../types";
+import { rangeLabel, shiftRange } from "../range";
 import { TeamPanel } from "./TeamPanel";
+import { TopBar } from "./TopBar";
 
 export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: () => void; teamKey: string }) {
   const [settings, setSettings] = useState(readSettings);
   const [teams, setTeams] = useState<Team[]>([]);
   const [teamId, setTeamId] = useState<string | null>(() => readStored(teamKey));
-  const [grid, setGrid] = useState<GridResponse | null>(null);
+  const [grid, setGrid] = useState<GridResponse | null>(() =>
+    loadCachedGrid(user.id, cacheKey(readStored(teamKey), readSettings(), BROWSER_TZ)),
+  );
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [hovered, setHovered] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number[]>([]);
+  const [meetings, setMeetings] = useState<Meeting[]>([]);
+  const [meetingsTick, setMeetingsTick] = useState(0);
+  const [meetingError, setMeetingError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [marking, setMarking] = useState(false);
+  const [myFree, setMyFree] = useState<Set<number>>(() => new Set());
+  const [myOriginal, setMyOriginal] = useState<AvailabilityWindow[]>([]);
+  const [markBusy, setMarkBusy] = useState(false);
+  const [markError, setMarkError] = useState<string | null>(null);
+  const paint = useRef<{ anchor: number; value: boolean; snapshot: Set<number> } | null>(null);
   const syncedRange = useRef<string | null>(null);
+  const gridKey = cacheKey(teamId, settings, BROWSER_TZ);
+  const applyGrid = useCallback(
+    (payload: GridResponse) => {
+      setGrid(payload);
+      saveCachedGrid(user.id, gridKey, payload);
+    },
+    [user.id, gridKey],
+  );
+  const leave = useCallback(() => {
+    clearGridCache();
+    onLogout();
+  }, [onLogout]);
 
   useEffect(() => {
     writeSettings(settings);
@@ -44,6 +88,11 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
 
   useEffect(() => {
     let cancelled = false;
+    const cached = loadCachedGrid(user.id, gridKey);
+    if (cached) {
+      setGrid(cached);
+    }
+    setLoading(true);
     const rangeKey = `${settings.dateFrom}:${settings.dateTo}`;
     const shouldSync = syncedRange.current !== rangeKey;
     const loader = shouldSync ? loadRange(settings, teamId) : fetchGrid(settings, teamId);
@@ -51,7 +100,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
       .then((payload) => {
         if (!cancelled) {
           syncedRange.current = rangeKey;
-          setGrid(payload);
+          applyGrid(payload);
           setError(null);
         }
       })
@@ -59,7 +108,7 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
         if (!cancelled) {
           setError(reason.message);
           if (reason instanceof UnauthorizedError) {
-            onLogout();
+            leave();
           }
         }
       })
@@ -71,36 +120,236 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
     return () => {
       cancelled = true;
     };
-  }, [settings, teamId, onLogout]);
+  }, [settings, teamId, user.id, gridKey, applyGrid, leave]);
+
+  useEffect(() => {
+    if (!teamId) {
+      setMeetings([]);
+      return undefined;
+    }
+    let cancelled = false;
+    fetchMeetings(teamId)
+      .then((items) => {
+        if (!cancelled) {
+          setMeetings(items);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMeetings([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [teamId, meetingsTick]);
+
+  useEffect(() => {
+    // выделение и разметка привязаны к клеткам текущей сетки: при смене настроек сбрасываем
+    setMarking(false);
+    setSelected([]);
+  }, [settings, teamId]);
+
+  useEffect(() => {
+    function stopPaint() {
+      paint.current = null;
+    }
+    window.addEventListener("mouseup", stopPaint);
+    return () => window.removeEventListener("mouseup", stopPaint);
+  }, []);
 
   const cellsByKey = useMemo(() => indexCells(grid?.cells ?? []), [grid]);
   const timeKeys = useMemo(() => uniqueClocks(grid?.cells ?? []), [grid]);
   const days = useMemo(() => uniqueDays(grid?.cells ?? []), [grid]);
+  const slotLength = grid ? Math.round(grid.slot_minutes / grid.step_minutes) : 1;
   const preview = useMemo(() => {
-    if (!grid || hovered === null) {
+    if (!grid || marking) {
       return new Set<number>();
     }
-    return new Set(slotPreview(grid.cells, hovered, Math.round(grid.slot_minutes / grid.step_minutes)));
-  }, [grid, hovered]);
+    if (hovered !== null) {
+      const hoveredSlot = slotPreview(grid.cells, hovered, slotLength);
+      if (hoveredSlot.length > 0) {
+        return new Set(hoveredSlot);
+      }
+    }
+    return new Set(selected);
+  }, [grid, hovered, selected, slotLength, marking]);
   const slotRange = useMemo(() => {
     if (!grid || preview.size === 0) {
       return null;
     }
     const indexes = Array.from(preview).sort((left, right) => left - right);
-    return `${moscowClock(grid.cells[indexes[0]].start)}–${moscowClock(grid.cells[indexes[indexes.length - 1]].end)}`;
+    return `${clockIn(grid.cells[indexes[0]].start, grid.tz)}–${clockIn(grid.cells[indexes[indexes.length - 1]].end, grid.tz)}`;
   }, [grid, preview]);
+  const meetingCells = useMemo(() => meetingCellKeys(grid?.cells ?? [], meetings), [grid, meetings]);
+  const summary = useMemo(() => memberSummary(grid?.members ?? []), [grid]);
+  const team = teams.find((item) => item.id === teamId) ?? null;
+  const me = grid?.members.find((member) => member.user_id === user.id) ?? null;
+
+  function refresh() {
+    refreshAll(settings, teamId, applyGrid, setError, setLoading);
+    setMeetingsTick((value) => value + 1);
+  }
+
+  function startMarking() {
+    if (!grid) {
+      return;
+    }
+    setMarkBusy(true);
+    setMarkError(null);
+    setSelected([]);
+    fetchAvailability(settings)
+      .then((windows) => {
+        setMyOriginal(windows);
+        setMyFree(windowsToCellSet(grid.cells, windows));
+        setMarking(true);
+      })
+      .catch((reason: Error) => setError(reason.message))
+      .finally(() => setMarkBusy(false));
+  }
+
+  function paintCell(index: number, start: boolean) {
+    if (!marking || !grid || index < 0) {
+      return;
+    }
+    if (start) {
+      paint.current = { anchor: index, value: !myFree.has(index), snapshot: new Set(myFree) };
+    }
+    const state = paint.current;
+    if (!state) {
+      return;
+    }
+    setMyFree(paintRect(grid.cells, state.snapshot, state.anchor, index, state.value));
+  }
+
+  function saveMarking() {
+    if (!grid) {
+      return;
+    }
+    const range = {
+      start: new Date(`${settings.dateFrom}T00:00:00`).getTime(),
+      end: new Date(`${settings.dateTo}T00:00:00`).getTime() + Constants.MS_IN_DAY,
+    };
+    setMarkBusy(true);
+    setMarkError(null);
+    saveAvailability(settings, windowsForSave(grid.cells, myOriginal, myFree, range))
+      .then(() => fetchGrid(settings, teamId))
+      .then((payload) => {
+        applyGrid(payload);
+        setMarking(false);
+      })
+      .catch((reason: Error) => setMarkError(reason.message))
+      .finally(() => setMarkBusy(false));
+  }
+
+  function pickSlot(index: number) {
+    if (marking || !grid || index < 0) {
+      return;
+    }
+    const indexes = slotPreview(grid.cells, index, slotLength);
+    setMeetingError(null);
+    if (indexes.length === 0) {
+      setSelected([]);
+      return;
+    }
+    setSelected(indexes);
+  }
+
+  function fixMeeting(title: string) {
+    if (!grid || !teamId || selected.length === 0) {
+      return;
+    }
+    if (selected.some((item) => meetingCells.has(item))) {
+      setMeetingError("Это время уже занято встречей");
+      return;
+    }
+    const first = grid.cells[selected[0]];
+    const last = grid.cells[selected[selected.length - 1]];
+    setSaving(true);
+    createMeeting(teamId, first.start, last.end, title)
+      .then(() => {
+        setSelected([]);
+        setMeetingError(null);
+        setMeetingsTick((value) => value + 1);
+      })
+      .catch((reason: Error) => setMeetingError(reason.message))
+      .finally(() => setSaving(false));
+  }
+
+  function removeMeeting(meeting: Meeting) {
+    if (!window.confirm("Отменить встречу?")) {
+      return;
+    }
+    cancelMeeting(meeting.id)
+      .then(() => setMeetingsTick((value) => value + 1))
+      .catch((reason: Error) => setError(reason.message));
+  }
+
   const cellIndex = useMemo(() => new Map((grid?.cells ?? []).map((cell, index) => [cell, index])), [grid]);
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
   const hasSlots = (grid?.cells ?? []).some((cell) => cell.slot_start);
+  const hasCalendar = (grid?.sources.length ?? 0) > 0;
+
+  const rowContext: RowContext = {
+    cellsByKey,
+    cellIndex,
+    preview,
+    slotRange,
+    meetingCells,
+    canFix: !marking,
+    marking,
+    mine: myFree,
+    selected: selectedSet,
+    onHover: setHovered,
+    onPick: pickSlot,
+    onPaint: paintCell,
+    stepMinutes: settings.stepMinutes,
+  };
 
   return (
     <div className="page">
       <div className="card">
+        <TopBar
+          user={user}
+          teams={teams}
+          teamId={teamId}
+          onSelect={setTeamId}
+          onCreated={(created) => {
+            setTeams((items) => [...items, created]);
+            setTeamId(created.id);
+          }}
+          onLogout={() => logout().finally(leave)}
+        />
         <div className="layout">
           <section>
-            <p className="eyebrow">СЕТКА</p>
-            <GridControls settings={settings} onChange={setSettings} />
+            <GridToolbar
+              settings={settings}
+              onChange={setSettings}
+              grid={grid}
+              loading={loading}
+              disabled={marking}
+              onRefresh={refresh}
+            />
             {error ? <p className="error">{error}</p> : null}
-            <div className="grid-wrap">
+            {marking ? (
+              <MarkBar
+                busy={markBusy}
+                hasCalendar={hasCalendar}
+                count={myFree.size}
+                error={markError}
+                onSave={saveMarking}
+                onClear={() => setMyFree(new Set())}
+                onCancel={() => {
+                  setMarking(false);
+                  setMarkError(null);
+                }}
+              />
+            ) : teamId && summary.missing.length > 0 ? (
+              <p className="warning">
+                Без учёта: {missingNames(summary)} — зелёные окна могут быть неверными
+              </p>
+            ) : null}
+            <div className={marking ? "grid-wrap marking" : "grid-wrap"}>
               <div
                 className="week-grid"
                 style={gridTemplateStyle(days.length, settings.stepMinutes)}
@@ -113,52 +362,42 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
                     <span className="day-head-date">{day.label}</span>
                   </div>
                 ))}
-                {timeKeys.map((clock) =>
-                  renderTimeRow(clock, days, cellsByKey, cellIndex, preview, slotRange, setHovered, settings.stepMinutes),
-                )}
+                {timeKeys.map((clock) => renderTimeRow(clock, days, rowContext))}
               </div>
             </div>
-            <SlotStatus grid={grid} hasSlots={hasSlots} preview={preview} />
+            {marking ? null : (
+              <SlotCard
+                grid={grid}
+                selected={selected}
+                hasSlots={hasSlots}
+                team={team}
+                saving={saving}
+                error={meetingError}
+                onFix={fixMeeting}
+                onClose={() => {
+                  setSelected([]);
+                  setMeetingError(null);
+                }}
+              />
+            )}
           </section>
           <aside className="sidebar">
-            <p className="user-line">
-              {user.email}{" "}
-              <button
-                type="button"
-                className="text-btn"
-                onClick={() => logout().finally(onLogout)}
-              >
-                Выйти
-              </button>
-            </p>
-            <TeamPanel
-              teams={teams}
-              teamId={teamId}
-              members={grid?.members ?? []}
-              onSelect={setTeamId}
-              onCreated={(team) => {
-                setTeams((items) => [...items, team]);
-                setTeamId(team.id);
-              }}
-            />
-            <p className="eyebrow">МОИ КАЛЕНДАРИ</p>
-            {loading && !grid ? <p className="muted">Загрузка…</p> : null}
-            <SourceList
+            <MyAvailability
               sources={grid?.sources ?? []}
-              onRemove={(source) => removeSource(source, () => refreshAll(settings, teamId, setGrid, setError, setLoading), setError)}
+              me={me}
+              loading={loading && !grid}
+              marking={marking}
+              busy={markBusy || !grid}
+              onMark={startMarking}
+              onRemove={(source) => removeSource(source, refresh, setError)}
             />
-            <div className="sidebar-actions">
-              <Link className="primary-link" to="/connect">
-                Подключить календарь
-              </Link>
-              <button
-                type="button"
-                className="text-btn"
-                onClick={() => refreshAll(settings, teamId, setGrid, setError, setLoading)}
-              >
-                Обновить
-              </button>
-            </div>
+            <TeamPanel
+              team={team}
+              members={grid?.members ?? []}
+              meetings={meetings}
+              tz={grid?.tz ?? BROWSER_TZ}
+              onCancelMeeting={removeMeeting}
+            />
           </aside>
         </div>
       </div>
@@ -166,67 +405,106 @@ export function WeekGrid({ user, onLogout, teamKey }: { user: User; onLogout: ()
   );
 }
 
-function GridControls({
+function GridToolbar({
   settings,
   onChange,
+  grid,
+  loading,
+  disabled,
+  onRefresh,
 }: {
   settings: GridSettings;
   onChange: (value: GridSettings) => void;
+  grid: GridResponse | null;
+  loading: boolean;
+  disabled: boolean;
+  onRefresh: () => void;
 }) {
+  const [viewOpen, setViewOpen] = useState(false);
   function onFieldChange(event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) {
     applyControl(event, settings, onChange);
   }
+  function shift(direction: 1 | -1) {
+    onChange({ ...settings, ...shiftRange(settings.dateFrom, settings.dateTo, direction) });
+  }
   return (
-    <form className="grid-controls" onSubmit={preventSubmit}>
-      <label className="control">
-        Детализация
-        <select name="stepMinutes" value={settings.stepMinutes} onChange={onFieldChange}>
-          {Constants.STEP_OPTIONS.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="control">
-        Длительность слота
-        <select name="slotMinutes" value={settings.slotMinutes} onChange={onFieldChange}>
-          {slotDurationOptions(settings.stepMinutes).map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="control">
-        Даты
-        <span className="control-pair">
-          <input name="dateFrom" type="date" value={settings.dateFrom} onChange={onFieldChange} />
-          <span className="control-dash">—</span>
-          <input name="dateTo" type="date" value={settings.dateTo} onChange={onFieldChange} />
+    <div className="toolbar">
+      <div className="toolbar-row">
+        <span className="week-nav">
+          <button type="button" className="nav-btn" aria-label="Предыдущая неделя" disabled={disabled} onClick={() => shift(-1)}>
+            ←
+          </button>
+          <span className="week-label">{rangeLabel(settings.dateFrom, settings.dateTo)}</span>
+          <button type="button" className="nav-btn" aria-label="Следующая неделя" disabled={disabled} onClick={() => shift(1)}>
+            →
+          </button>
         </span>
-      </label>
-      <label className="control">
-        Время
-        <span className="control-pair">
-          <input
-            name="timeFrom"
-            type="time"
-            step={Constants.TIME_INPUT_STEP}
-            value={settings.timeFrom}
-            onChange={onFieldChange}
-          />
-          <span className="control-dash">—</span>
-          <input
-            name="timeTo"
-            type="time"
-            step={Constants.TIME_INPUT_STEP}
-            value={settings.timeTo}
-            onChange={onFieldChange}
-          />
+        <label className="control control-inline">
+          Встреча
+          <select name="slotMinutes" value={settings.slotMinutes} disabled={disabled} onChange={onFieldChange}>
+            {slotDurationOptions(settings.stepMinutes).map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button type="button" className="text-btn" onClick={() => setViewOpen((open) => !open)}>
+          ⚙ Вид
+        </button>
+        <span className="toolbar-fresh">
+          {grid ? `Данные от ${clockIn(grid.generated_at, grid.tz)}` : ""}
+          {loading ? " · обновляется…" : ""}
+          <button type="button" className="text-btn" onClick={onRefresh} disabled={loading}>
+            ⟳ Обновить
+          </button>
         </span>
-      </label>
-    </form>
+      </div>
+      {viewOpen ? (
+        <form className="grid-controls" onSubmit={preventSubmit}>
+          <label className="control">
+            Детализация
+            <select name="stepMinutes" value={settings.stepMinutes} disabled={disabled} onChange={onFieldChange}>
+              {Constants.STEP_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="control">
+            Даты
+            <span className="control-pair">
+              <input name="dateFrom" type="date" value={settings.dateFrom} disabled={disabled} onChange={onFieldChange} />
+              <span className="control-dash">—</span>
+              <input name="dateTo" type="date" value={settings.dateTo} disabled={disabled} onChange={onFieldChange} />
+            </span>
+          </label>
+          <label className="control">
+            Часы
+            <span className="control-pair">
+              <input
+                name="timeFrom"
+                type="time"
+                step={Constants.TIME_INPUT_STEP}
+                value={settings.timeFrom}
+                disabled={disabled}
+                onChange={onFieldChange}
+              />
+              <span className="control-dash">—</span>
+              <input
+                name="timeTo"
+                type="time"
+                step={Constants.TIME_INPUT_STEP}
+                value={settings.timeTo}
+                disabled={disabled}
+                onChange={onFieldChange}
+              />
+            </span>
+          </label>
+        </form>
+      ) : null}
+    </div>
   );
 }
 
@@ -243,31 +521,76 @@ function alignSlotMinutes(stepMinutes: number, slotMinutes: number): number {
   return next ?? options[options.length - 1] ?? stepMinutes;
 }
 
-function SlotStatus({
+function SlotCard({
   grid,
+  selected,
   hasSlots,
-  preview,
+  team,
+  saving,
+  error,
+  onFix,
+  onClose,
 }: {
   grid: GridResponse | null;
+  selected: number[];
   hasSlots: boolean;
-  preview: Set<number>;
+  team: Team | null;
+  saving: boolean;
+  error: string | null;
+  onFix: (title: string) => void;
+  onClose: () => void;
 }) {
+  const [title, setTitle] = useState("");
   if (!grid || grid.total === 0) {
     return null;
   }
-  if (!hasSlots) {
-    return <p className="muted">Нет общего свободного слота такой длительности</p>;
+  if (selected.length === 0) {
+    return (
+      <p className="muted slot-hint">
+        {hasSlots ? "Нажмите на зелёную клетку, чтобы выбрать слот" : "Нет общего свободного слота такой длительности"}
+      </p>
+    );
   }
-  if (preview.size === 0) {
-    return <p className="muted">Наведите на зелёную клетку, чтобы увидеть слот</p>;
-  }
-  const indexes = Array.from(preview).sort((left, right) => left - right);
-  const first = grid.cells[indexes[0]];
-  const last = grid.cells[indexes[indexes.length - 1]];
+  const first = grid.cells[selected[0]];
+  const last = grid.cells[selected[selected.length - 1]];
   return (
-    <p className="slot-switcher-label">
-      Слот: {formatCellDay(first)}, {moscowClock(first.start)}–{moscowClock(last.end)}
-    </p>
+    <form
+      className="slot-card"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onFix(title);
+        setTitle("");
+      }}
+    >
+      <div className="slot-card-head">
+        <span className="slot-card-title">
+          Выбран слот: {formatCellDay(first)}, {clockIn(first.start, grid.tz)}–{clockIn(last.end, grid.tz)}
+        </span>
+        <button type="button" className="source-remove" aria-label="Снять выбор" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      <span className="muted">
+        Свободны {first.free_count} из {first.total}
+        {team ? "" : " · это только ваша занятость"}
+      </span>
+      {team ? (
+        <span className="slot-card-actions">
+          <input
+            value={title}
+            maxLength={200}
+            placeholder="Название встречи (необязательно)"
+            onChange={(event) => setTitle(event.target.value)}
+          />
+          <button type="submit" className="primary" disabled={saving}>
+            {saving ? "Сохраняем…" : "Зафиксировать встречу"}
+          </button>
+        </span>
+      ) : (
+        <span className="muted">Чтобы назначить встречу, выберите команду вверху.</span>
+      )}
+      {error ? <p className="error">{error}</p> : null}
+    </form>
   );
 }
 
@@ -327,48 +650,169 @@ function clampDates(settings: GridSettings): GridSettings {
   return next;
 }
 
-function renderTimeRow(
-  clock: string,
-  days: DayHeader[],
-  cellsByKey: Map<string, GridCell>,
-  cellIndex: Map<GridCell, number>,
-  preview: Set<number>,
-  slotRange: string | null,
-  onHover: (index: number | null) => void,
-  stepMinutes: number,
-) {
+type RowContext = {
+  cellsByKey: Map<string, GridCell>;
+  cellIndex: Map<GridCell, number>;
+  preview: Set<number>;
+  slotRange: string | null;
+  meetingCells: Map<number, Meeting>;
+  canFix: boolean;
+  marking: boolean;
+  mine: Set<number>;
+  selected: Set<number>;
+  onHover: (index: number | null) => void;
+  onPick: (index: number) => void;
+  onPaint: (index: number, start: boolean) => void;
+  stepMinutes: number;
+};
+
+function MarkBar({
+  busy,
+  hasCalendar,
+  count,
+  error,
+  onSave,
+  onClear,
+  onCancel,
+}: {
+  busy: boolean;
+  hasCalendar: boolean;
+  count: number;
+  error: string | null;
+  onSave: () => void;
+  onClear: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="mark-bar">
+      <p className="mark-hint">
+        <strong>Мои свободные окна.</strong> Нажмите на клетку или выделите прямоугольник мышью. В днях, где отмечено
+        хоть что-то, остальное время считается занятым; дни без отметок команда не учитывает.
+      </p>
+      {hasCalendar ? (
+        <p className="warning">У вас подключён календарь — сетка считается по нему, ручные окна не учитываются.</p>
+      ) : null}
+      <span className="slot-card-actions">
+        <button type="button" className="primary" disabled={busy} onClick={onSave}>
+          {busy ? "Сохраняем…" : `Сохранить (${count})`}
+        </button>
+        <button type="button" className="text-btn" disabled={busy} onClick={onClear}>
+          Очистить
+        </button>
+        <button type="button" className="text-btn" disabled={busy} onClick={onCancel}>
+          Отмена
+        </button>
+      </span>
+      {error ? <p className="error">{error}</p> : null}
+    </div>
+  );
+}
+
+function MyAvailability({
+  sources,
+  me,
+  loading,
+  marking,
+  busy,
+  onMark,
+  onRemove,
+}: {
+  sources: Source[];
+  me: GridMember | null;
+  loading: boolean;
+  marking: boolean;
+  busy: boolean;
+  onMark: () => void;
+  onRemove: (source: Source) => void;
+}) {
+  const manual = me?.status === "manual";
+  const unknown = sources.length === 0 && !manual;
+  return (
+    <section className={unknown ? "panel-block panel-attention" : "panel-block"}>
+      <p className="eyebrow">МОЯ ЗАНЯТОСТЬ</p>
+      {loading ? <p className="muted">Загрузка…</p> : null}
+      {sources.length > 0 ? <SourceList sources={sources} onRemove={onRemove} /> : null}
+      {manual ? <p className="source-meta">Окна отмечены вручную</p> : null}
+      {unknown && !loading ? (
+        <p className="muted empty-note">
+          Сервис пока не знает, когда вы свободны. Подключите календарь или отметьте окна вручную.
+        </p>
+      ) : null}
+      <div className="panel-actions">
+        <Link className="secondary" to="/connect">
+          + Календарь
+        </Link>
+        <button type="button" className="secondary" disabled={busy || marking} onClick={onMark}>
+          ✎ Окна вручную
+        </button>
+      </div>
+      {sources.length > 0 ? <p className="source-meta">Календарь главнее ручных окон.</p> : null}
+    </section>
+  );
+}
+
+function renderTimeRow(clock: string, days: DayHeader[], context: RowContext) {
   return (
     <div key={clock} className="contents-row">
-      <div className="hour-label" style={rowItemStyle(stepMinutes)}>
-        {formatClockLabel(clock, stepMinutes)}
+      <div className="hour-label" style={rowItemStyle(context.stepMinutes)}>
+        {formatClockLabel(clock, context.stepMinutes)}
       </div>
       {days.map((day) => {
-        const cell = cellsByKey.get(cellKey(day.index, clock));
-        return renderCell(day.index, clock, cell, cell ? cellIndex.get(cell) ?? -1 : -1, preview, slotRange, onHover, stepMinutes);
+        const cell = context.cellsByKey.get(cellKey(day.index, clock));
+        return renderCell(day.index, clock, cell, cell ? context.cellIndex.get(cell) ?? -1 : -1, context);
       })}
     </div>
   );
 }
 
-function renderCell(
-  dayIndex: number,
-  clock: string,
-  cell: GridCell | undefined,
-  index: number,
-  preview: Set<number>,
-  slotRange: string | null,
-  onHover: (index: number | null) => void,
-  stepMinutes: number,
-) {
-  const kind = slotKind(cell, index, preview);
+function renderCell(dayIndex: number, clock: string, cell: GridCell | undefined, index: number, context: RowContext) {
+  const kind = context.marking ? null : slotKind(cell, index, context.preview);
+  const meeting = context.marking ? undefined : context.meetingCells.get(index);
+  const classes = ["cell"];
+  if (kind === "active") {
+    classes.push("in-slot");
+    if (context.canFix) {
+      classes.push("pickable");
+    }
+  } else if (kind === "alt") {
+    classes.push("in-slot-alt");
+  }
+  if (meeting) {
+    classes.push("meeting");
+  }
+  if (context.selected.has(index)) {
+    classes.push("selected");
+  }
+  if (context.marking) {
+    classes.push("markable");
+    if (context.mine.has(index)) {
+      classes.push("mine");
+    }
+  }
   return (
     <div
       key={`${dayIndex}-${clock}`}
-      className={kind === "active" ? "cell in-slot" : kind === "alt" ? "cell in-slot-alt" : "cell"}
-      style={cellFillStyle(cell, kind, stepMinutes)}
-      onMouseEnter={() => onHover(index >= 0 ? index : null)}
+      className={classes.join(" ")}
+      style={
+        context.marking
+          ? { ...rowItemStyle(context.stepMinutes), backgroundColor: Constants.CELL_BASE }
+          : cellFillStyle(cell, kind, context.stepMinutes, meeting !== undefined)
+      }
+      onMouseEnter={() => {
+        context.onHover(index >= 0 ? index : null);
+        context.onPaint(index, false);
+      }}
+      onMouseDown={(event) => {
+        if (context.marking) {
+          event.preventDefault();
+          context.onPaint(index, true);
+        }
+      }}
+      onClick={() => context.onPick(index)}
     >
-      {cell ? <span className="cell-tip">{tooltipText(cell, kind === "active" ? slotRange : null)}</span> : null}
+      {cell && !context.marking ? (
+        <span className="cell-tip">{tooltipText(cell, kind === "active" ? context.slotRange : null, meeting)}</span>
+      ) : null}
     </div>
   );
 }
@@ -554,13 +998,14 @@ function formatClockLabel(clock: string, stepMinutes: number): string {
   return "";
 }
 
-function tooltipText(cell: GridCell, slotRange: string | null): string {
+function tooltipText(cell: GridCell, slotRange: string | null, meeting?: Meeting): string {
   const from = cellClock(cell);
   const duration = Math.round((Date.parse(cell.end) - Date.parse(cell.start)) / Constants.MS_IN_MINUTE);
   const until = shiftClock(from, duration);
   const busy = cell.total - cell.free_count;
   const title = slotRange ? `Слот ${slotRange}` : `${from}–${until}`;
-  return `${title}\nСвободны: ${cell.free_count}/${cell.total}\nЗаняты: ${busy}`;
+  const base = `${title}\nСвободны: ${cell.free_count}/${cell.total}\nЗаняты: ${busy}`;
+  return meeting ? `Встреча: ${meeting.title ?? "без названия"}\n${base}` : base;
 }
 
 function providerLabel(provider: string): string {
@@ -612,6 +1057,7 @@ function cellFillStyle(
   cell: GridCell | undefined,
   kind: "active" | "alt" | null,
   stepMinutes: number,
+  isMeeting: boolean,
 ): CSSProperties {
   const busyRatio = cell && cell.total > 0 ? (cell.total - cell.free_count) / cell.total : 0;
   const busyAlpha = busyRatio * Constants.BUSY_MAX_ALPHA;
@@ -624,6 +1070,11 @@ function cellFillStyle(
   if (kind === "alt") {
     layers.unshift(
       `linear-gradient(rgba(${Constants.SLOT_RGB}, ${Constants.SLOT_ALT_ALPHA}), rgba(${Constants.SLOT_RGB}, ${Constants.SLOT_ALT_ALPHA}))`,
+    );
+  }
+  if (isMeeting) {
+    layers.unshift(
+      `linear-gradient(rgba(${Constants.MEETING_RGB}, ${Constants.MEETING_ALPHA}), rgba(${Constants.MEETING_RGB}, ${Constants.MEETING_ALPHA}))`,
     );
   }
   return {
@@ -641,18 +1092,6 @@ function slotKind(cell: GridCell | undefined, index: number, preview: Set<number
     return "active";
   }
   return cell.in_slot ? "alt" : null;
-}
-
-function moscowClock(iso: string): string {
-  const parts = new Intl.DateTimeFormat("ru-RU", {
-    timeZone: "Europe/Moscow",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date(iso));
-  const hour = parts.find((part) => part.type === "hour")?.value ?? "00";
-  const minute = parts.find((part) => part.type === "minute")?.value ?? "00";
-  return `${hour}:${minute}`;
 }
 
 function readStored(key: string): string | null {
@@ -685,6 +1124,11 @@ function readSettings(): GridSettings {
       return fallback;
     }
     const parsed = JSON.parse(raw) as Partial<GridSettings>;
+    if (parsed.dateTo && parsed.dateTo < fallback.dateFrom) {
+      // сохранённый диапазон целиком в прошлом — открываем с сегодняшнего дня
+      parsed.dateFrom = fallback.dateFrom;
+      parsed.dateTo = fallback.dateTo;
+    }
     return clampDates({
       stepMinutes: parsed.stepMinutes ?? fallback.stepMinutes,
       slotMinutes: alignSlotMinutes(parsed.stepMinutes ?? fallback.stepMinutes, parsed.slotMinutes ?? fallback.slotMinutes),
@@ -738,10 +1182,13 @@ class Constants {
   static readonly HOUR_CELL_HEIGHT = 32;
   static readonly CELL_MIN_HEIGHT = 10;
   static readonly MS_IN_MINUTE = 60000;
+  static readonly MS_IN_DAY = 86400000;
   static readonly BUSY_RGB = "226, 56, 56";
   static readonly SLOT_RGB = "21, 92, 45";
   static readonly BUSY_MAX_ALPHA = 0.6;
   static readonly SLOT_ALPHA = 0.55;
   static readonly SLOT_ALT_ALPHA = 0.18;
+  static readonly MEETING_RGB = "29, 78, 216";
+  static readonly MEETING_ALPHA = 0.5;
   static readonly CELL_BASE = "#f7f7f7";
 }

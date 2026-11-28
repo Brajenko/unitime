@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
@@ -28,18 +29,23 @@ def get_grid(
     time_from: str = Query(default="09:00"),
     time_to: str = Query(default="21:00"),
     team_id: uuid.UUID | None = None,
+    tz: str = Query(default="Europe/Moscow"),
     user: AppUser = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    today = datetime.now(DomainConstants.DISPLAY_TZ).date()
+    try:
+        zone = ZoneInfo(tz)
+    except (KeyError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Неизвестный часовой пояс") from error
+    today = datetime.now(zone).date()
     fallback = default_grid_spec(today)
     start = date.fromisoformat(date_from) if date_from else fallback.date_from
     end = date.fromisoformat(date_to) if date_to else fallback.date_to
     try:
-        spec = validate_grid_spec(start, end, time_from, time_to, step_minutes, slot_minutes)
+        spec = validate_grid_spec(start, end, time_from, time_to, step_minutes, slot_minutes, zone)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    now = datetime.now(DomainConstants.DISPLAY_TZ)
+    now = datetime.now(zone)
     if team_id is None:
         user_ids = [user.id]
     else:
@@ -58,6 +64,7 @@ def get_grid(
             "tf": time_from,
             "tt": time_to,
             "team": team_id,
+            "tz": zone.key,
             "viewer": user.id,
             "minute": now.strftime("%Y-%m-%dT%H:%M"),
         },
@@ -99,10 +106,13 @@ def get_grid(
                 calendars=item.calendars,
                 last_synced_at=item.last_synced_at,
                 in_overlay=item.in_overlay,
+                status=item.status,
             )
             for item in members
         ],
         team_id=str(team_id) if team_id else None,
+        generated_at=datetime.now(timezone.utc),
+        tz=zone.key,
     )
     body = payload.model_dump_json()
     cache.put(key, body)

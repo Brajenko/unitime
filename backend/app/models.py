@@ -150,3 +150,30 @@ class BusyIntervalRow(Base):
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
 
     collection: Mapped[CalendarCollection] = relationship(back_populates="busy_intervals")
+
+
+class Meeting(Base):
+    """Зафиксированная встреча команды. Пересечение встреч одной команды запрещено ограничением в БД."""
+
+    __tablename__ = "meetings"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    period = mapped_column(TSTZRANGE, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    author: Mapped[AppUser] = relationship()
+    team: Mapped[Team] = relationship()
+
+
+class AvailabilityWindow(Base):
+    """Свободное окно, отмеченное вручную участником без календаря (US-07)."""
+
+    __tablename__ = "availability_windows"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app_users.id"), nullable=False, index=True)
+    period = mapped_column(TSTZRANGE, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

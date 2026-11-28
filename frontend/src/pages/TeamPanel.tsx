@@ -1,91 +1,105 @@
-import { FormEvent, useState } from "react";
-import { createTeam } from "../api";
-import type { GridMember, Team } from "../types";
-
-const STALE_MINUTES = 30;
+import { useState } from "react";
+import { memberMark, memberNote, memberSummary, sortMembers } from "../members";
+import { meetingLabel } from "../meetings";
+import type { GridMember, Meeting, Team } from "../types";
 
 export function TeamPanel({
-  teams,
-  teamId,
+  team,
   members,
-  onSelect,
-  onCreated,
+  meetings,
+  tz,
+  onCancelMeeting,
 }: {
-  teams: Team[];
-  teamId: string | null;
+  team: Team | null;
   members: GridMember[];
-  onSelect: (teamId: string | null) => void;
-  onCreated: (team: Team) => void;
+  meetings: Meeting[];
+  tz: string;
+  onCancelMeeting: (meeting: Meeting) => void;
 }) {
-  const [name, setName] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [copied, setCopied] = useState(false);
-  const team = teams.find((item) => item.id === teamId) ?? null;
+  const summary = memberSummary(members);
+  const now = Date.now();
 
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    createTeam(name)
-      .then((created) => {
-        setName("");
-        setError(null);
-        onCreated(created);
-      })
-      .catch((reason: Error) => setError(reason.message));
+  if (!team) {
+    return (
+      <section className="panel-block">
+        <p className="eyebrow">КОМАНДА</p>
+        <p className="muted empty-note">
+          Сейчас показана только ваша занятость. Выберите команду вверху или создайте новую и пригласите участников.
+        </p>
+      </section>
+    );
   }
 
   return (
-    <div className="team-panel">
-      <p className="eyebrow">КОМАНДА</p>
-      <select value={teamId ?? ""} onChange={(event) => onSelect(event.target.value || null)}>
-        <option value="">Только я</option>
-        {teams.map((item) => (
-          <option key={item.id} value={item.id}>
-            {item.name}
-          </option>
-        ))}
-      </select>
-      {team ? (
-        <div className="invite">
-          <button
-            type="button"
-            className="text-btn"
-            onClick={() => {
-              setInviteOpen((open) => !open);
-              setCopied(false);
-            }}
-          >
-            {inviteOpen ? "Скрыть ссылку-приглашение" : "Показать ссылку-приглашение"}
-          </button>
-          {inviteOpen ? (
-            <div className="invite-box">
-              <input readOnly value={inviteUrl(team)} onFocus={(e) => e.target.select()} />
-              <button type="button" className="text-btn" onClick={() => copyInvite(inviteUrl(team), setCopied)}>
-                {copied ? "Скопировано" : "Копировать"}
-              </button>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-      <ul className="source-list">
-        {members.map((member) => (
-          <li key={member.user_id} className="source-item">
-            <span className={`status-mark ${memberStatus(member)}`} />
-            <span>
-              <span className="source-name">{member.email}</span>
-              <span className="source-meta">{memberNote(member)}</span>
-            </span>
-          </li>
-        ))}
-      </ul>
-      <form className="team-create" onSubmit={submit}>
-        <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Новая команда" required />
-        <button type="submit" className="text-btn">
-          Создать
+    <>
+      <section className="panel-block">
+        <p className="eyebrow">
+          КОМАНДА · {summary.counted} из {summary.total} учтены
+        </p>
+        <ul className="source-list">
+          {sortMembers(members).map((member) => (
+            <li key={member.user_id} className="source-item">
+              <span className={`status-mark ${memberMark(member)}`} />
+              <span>
+                <span className="source-name">{member.email}</span>
+                <span className="source-meta">{memberNote(member, now)}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => {
+            setInviteOpen(true);
+            copyInvite(inviteUrl(team), setCopied);
+          }}
+        >
+          {copied ? "Ссылка скопирована" : "Пригласить"}
         </button>
-      </form>
-      {error ? <p className="error">{error}</p> : null}
-    </div>
+        {inviteOpen ? (
+          <input
+            className="invite-input"
+            readOnly
+            value={inviteUrl(team)}
+            onFocus={(event) => event.target.select()}
+          />
+        ) : null}
+      </section>
+      <section className="panel-block">
+        <p className="eyebrow">ВСТРЕЧИ</p>
+        {meetings.length === 0 ? (
+          <p className="muted empty-note">Пока нет встреч. Нажмите на зелёный слот на сетке, чтобы назначить.</p>
+        ) : (
+          <ul className="source-list">
+            {meetings.map((meeting) => (
+              <li key={meeting.id} className="source-item">
+                <span className="status-mark status-meeting" />
+                <span className="source-text">
+                  <span className="source-name">{meeting.title ?? "Встреча"}</span>
+                  <span className="source-meta">
+                    {meetingLabel(meeting, tz)} · {meeting.created_by_email}
+                  </span>
+                </span>
+                {meeting.can_cancel ? (
+                  <button
+                    type="button"
+                    className="source-remove"
+                    title="Отменить встречу"
+                    aria-label="Отменить встречу"
+                    onClick={() => onCancelMeeting(meeting)}
+                  >
+                    ×
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </>
   );
 }
 
@@ -98,37 +112,4 @@ function copyInvite(url: string, setCopied: (value: boolean) => void) {
     .writeText(url)
     .then(() => setCopied(true))
     .catch(() => setCopied(false));
-}
-
-function memberStatus(member: GridMember): string {
-  if (!member.in_overlay) {
-    return "status-pending";
-  }
-  return isStale(member.last_synced_at) ? "status-auth_failed" : "status-active";
-}
-
-function memberNote(member: GridMember): string {
-  if (!member.in_overlay) {
-    return "нет календарей";
-  }
-  if (!member.last_synced_at) {
-    return `${member.calendars} календ. · ещё не обновлялось`;
-  }
-  return `${member.calendars} календ. · обновлено ${agoLabel(member.last_synced_at)}`;
-}
-
-function isStale(iso: string | null): boolean {
-  return !iso || Date.now() - Date.parse(iso) > STALE_MINUTES * 60000;
-}
-
-function agoLabel(iso: string): string {
-  const minutes = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60000));
-  if (minutes < 1) {
-    return "только что";
-  }
-  if (minutes < 60) {
-    return `${minutes} мин назад`;
-  }
-  const hours = Math.floor(minutes / 60);
-  return hours < 24 ? `${hours} ч назад` : `${Math.floor(hours / 24)} дн назад`;
 }
